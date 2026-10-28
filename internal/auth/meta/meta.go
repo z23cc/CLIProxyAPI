@@ -64,6 +64,23 @@ type TokenData struct {
 	ErrorDescription string `json:"error_description,omitempty"`
 }
 
+// MintError is returned by MintAPIKey when the mint endpoint answers with a non-2xx status.
+// It exposes the HTTP status through StatusCode() so callers can classify the failure with errors.As.
+type MintError struct {
+	Status int
+	Body   string
+}
+
+// Error implements the error interface.
+func (e *MintError) Error() string {
+	return fmt.Sprintf("meta auth: mint key failed (HTTP %d): %s", e.Status, e.Body)
+}
+
+// StatusCode returns the HTTP status code of the failed mint response.
+func (e *MintError) StatusCode() int {
+	return e.Status
+}
+
 // MintedKeyResponse represents the API key response minted from https://api.meta.ai/muse-code/key.
 type MintedKeyResponse struct {
 	APIKey           string `json:"api_key"`
@@ -469,7 +486,7 @@ func (a *MetaAuth) MintAPIKey(ctx context.Context, dcaToken string) (*MintedKeyR
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("meta auth: mint key failed (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, &MintError{Status: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
 
 	var minted MintedKeyResponse
