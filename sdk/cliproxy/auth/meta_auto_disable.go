@@ -152,6 +152,39 @@ func (a *Auth) MetaAutoDisableStatus() (state, reason string, since time.Time, o
 	return a.metaAD.state, a.metaAD.reason, a.metaAD.since, true
 }
 
+// MetaAutoDisableMarked reports whether metadata carries the marker this core writes when it
+// auto-disables a dead Meta credential (disabled_by "cliproxyapi"). Other markers, such as
+// the usage-statistics plugin's, do not count.
+func MetaAutoDisableMarked(metadata map[string]any) bool {
+	value, _ := metadata[metaADKeyDisabledBy].(string)
+	return strings.TrimSpace(value) == metaADDisabledBy
+}
+
+// MetaAutoDisableMarkers returns the auto-disable markers this core wrote on a credential
+// (empty strings when it carries none).
+func MetaAutoDisableMarkers(auth *Auth) (by, reason, at string) {
+	if auth == nil || !MetaAutoDisableMarked(auth.Metadata) {
+		return "", "", ""
+	}
+	reason, _ = auth.Metadata[metaADKeyReason].(string)
+	at, _ = auth.Metadata[metaADKeyDisabledAt].(string)
+	return metaADDisabledBy, reason, at
+}
+
+// ClearMetaAutoDisableMarkers removes the core's auto-disable markers and any in-memory
+// tracking from auth, for a credential that is being re-enabled. It reports whether a
+// marker was removed. Markers written by anyone else are left alone.
+func ClearMetaAutoDisableMarkers(auth *Auth) bool {
+	if auth == nil || !MetaAutoDisableMarked(auth.Metadata) {
+		return false
+	}
+	auth.metaAD.clearPending()
+	delete(auth.Metadata, metaADKeyDisabledBy)
+	delete(auth.Metadata, metaADKeyReason)
+	delete(auth.Metadata, metaADKeyDisabledAt)
+	return true
+}
+
 func (m *Manager) metaAutoDisableEnabled() bool {
 	cfg := m.runtimeConfigSnapshot()
 	return cfg != nil && cfg.Routing.MetaAutoDisable.Enabled

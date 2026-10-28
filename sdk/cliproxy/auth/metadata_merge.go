@@ -30,7 +30,11 @@ func MergeExistingAuthMetadata(target *Auth, existingMap map[string]any) {
 	if target.Metadata == nil {
 		target.Metadata = make(map[string]any)
 	}
-	if _, explicitlySet := target.Metadata["disabled"]; !explicitlySet {
+	// A fresh login replaces a credential the core auto-disabled as dead: neither that
+	// disable nor its markers carry over. Other disables (an admin's, the usage plugin's)
+	// keep their existing behaviour.
+	autoDisabled := MetaAutoDisableMarked(existingMap)
+	if _, explicitlySet := target.Metadata["disabled"]; !explicitlySet && !autoDisabled {
 		if disabled, ok := existingMap["disabled"].(bool); ok {
 			target.Disabled = disabled
 		}
@@ -38,6 +42,12 @@ func MergeExistingAuthMetadata(target *Auth, existingMap map[string]any) {
 	for k, v := range existingMap {
 		if IsAuthTokenPayloadKey(k) {
 			continue
+		}
+		if autoDisabled {
+			switch k {
+			case "disabled", metaADKeyDisabledBy, metaADKeyReason, metaADKeyDisabledAt:
+				continue
+			}
 		}
 		if strings.EqualFold(strings.TrimSpace(target.Provider), "meta") {
 			switch CanonicalCredentialMetadataKey(k) {

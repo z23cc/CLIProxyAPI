@@ -727,6 +727,18 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quota authFileQu
 	if !nextRetryAfter.IsZero() {
 		entry["next_retry_after"] = nextRetryAfter
 	}
+	if by, reason, at := coreauth.MetaAutoDisableMarkers(auth); by != "" {
+		entry["disabled_by"] = by
+		if reason != "" {
+			entry["disabled_reason"] = reason
+		}
+		if at != "" {
+			entry["disabled_at"] = at
+		}
+	}
+	if state, reason, since, ok := auth.MetaAutoDisableStatus(); ok {
+		entry["meta_auto_disable"] = gin.H{"state": state, "reason": reason, "since": since.UTC().Format(time.RFC3339)}
+	}
 	if path != "" {
 		entry["path"] = path
 		entry["source"] = "file"
