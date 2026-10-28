@@ -1193,10 +1193,33 @@ func TestMetaAutoDisableFixup2_ConfirmationKeepsUnrelatedAuthLevelCooldown(t *te
 		})
 	}
 
-	t.Run("mixed_model_and_auth_level", func(t *testing.T) {
-		m, _, recoverAt := metaADFxFirstMintFlow(t, http.StatusForbidden, nil)
-		metaADFxMarkAuthLevelFailure(m, http.StatusServiceUnavailable)
-		metaADFxRequireAuthLevelCooldown(t, metaADFxGet(t, m, metaADFxPrimaryID), http.StatusServiceUnavailable, "before the confirmation")
+	// The auth-level aggregate is derived from the model states: once model-a's rejection
+	// state is reset, a credential whose only remaining cooldown is on model-b is usable
+	// without a model key and for model-a.
+	t.Run("model_scoped_403_and_503", func(t *testing.T) {
+		m, _, _ := metaADFxFirstMintFlow(t, http.StatusForbidden, nil)
+		// The quota state on model-c would keep its own deadline in the aggregate; drop it
+		// so model-b's 503 is the only remaining cooldown.
+		m.mu.Lock()
+		delete(m.auths[metaADFxPrimaryID].ModelStates, metaADFxModelC)
+		m.mu.Unlock()
+
+		m.MarkResult(context.Background(), Result{
+			AuthID:   metaADFxPrimaryID,
+			Provider: "meta",
+			Model:    metaADFxModelB,
+			Success:  false,
+			Error:    &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "model-b unavailable"},
+		})
+		before := metaADFxGet(t, m, metaADFxPrimaryID)
+		stB := before.ModelStates[metaADFxModelB]
+		if stB == nil || !stB.Unavailable || !stB.NextRetryAfter.After(time.Now()) || stB.LastError == nil || stB.LastError.StatusCode() != http.StatusServiceUnavailable {
+			t.Fatalf("precondition: model-b 503 state = %+v", stB)
+		}
+		if !before.Unavailable {
+			t.Fatalf("precondition: aggregate is not cooling")
+		}
+		retryB := stB.NextRetryAfter
 
 		metaADFxMakeDue(m, metaADFxPrimaryID)
 		m.refreshAuth(context.Background(), metaADFxPrimaryID)
@@ -1206,10 +1229,22 @@ func TestMetaAutoDisableFixup2_ConfirmationKeepsUnrelatedAuthLevelCooldown(t *te
 		if st := got.ModelStates[metaADFxModelA]; st != nil && (st.Unavailable || !st.NextRetryAfter.IsZero() || st.LastError != nil) {
 			t.Fatalf("model-a 403 state not reset: %+v", st)
 		}
-		metaADFxRequireAuthLevelCooldown(t, got, http.StatusServiceUnavailable, "after the confirmation")
-		stC := got.ModelStates[metaADFxModelC]
-		if stC == nil || !stC.Unavailable || !stC.NextRetryAfter.Equal(recoverAt) {
-			t.Fatalf("unrelated quota state was touched: %+v", stC)
+		stB = got.ModelStates[metaADFxModelB]
+		if stB == nil || !stB.Unavailable || !stB.NextRetryAfter.Equal(retryB) || stB.LastError == nil || stB.LastError.StatusCode() != http.StatusServiceUnavailable {
+			t.Fatalf("model-b 503 state changed: %+v", stB)
+		}
+		if got.Unavailable || !got.NextRetryAfter.IsZero() {
+			t.Fatalf("aggregate Unavailable=%v NextRetryAfter=%v, want it recomputed from the remaining states (usable)", got.Unavailable, got.NextRetryAfter)
+		}
+		now := time.Now()
+		for _, model := range []string{"", metaADFxModelA} {
+			if blocked, _, _ := isAuthBlockedForModel(got, model, now); blocked {
+				t.Fatalf("auth blocked for model %q although model-a is usable", model)
+			}
+		}
+		blocked, _, next := isAuthBlockedForModel(got, metaADFxModelB, now)
+		if !blocked || !next.Equal(retryB) {
+			t.Fatalf("model-b: blocked=%v next=%v, want blocked until %v", blocked, next, retryB)
 		}
 	})
 }

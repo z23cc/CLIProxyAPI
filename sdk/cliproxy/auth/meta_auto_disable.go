@@ -305,7 +305,8 @@ func metaADRejectionError(err *Error) bool {
 // cooling for 30 minutes after a confirmed mint. Cooldowns that come from other
 // causes (quota, transient errors, at auth level or on a model) are left alone: the
 // auth-level state is only touched when its LastError is the 401/403, and the
-// aggregate availability is only recomputed when a model state was actually reset.
+// aggregate availability is only recomputed when a model state was actually reset
+// (from the remaining model states, exactly as a model-scoped result does).
 func metaADClearRejectionLeftovers(auth *Auth, now time.Time) bool {
 	changed := false
 	authLevel := metaADRejectionError(auth.LastError)
@@ -324,9 +325,6 @@ func metaADClearRejectionLeftovers(auth *Auth, now time.Time) bool {
 	auth.NextRefreshAfter = time.Time{}
 	auth.RefreshFailures = 0
 
-	// An auth-level cooldown from another cause survives the aggregate recompute below.
-	keepCooldown := !authLevel && auth.NextRetryAfter.After(now)
-	prevUnavailable, prevRetryAfter := auth.Unavailable, auth.NextRetryAfter
 	modelReset := false
 	for _, state := range auth.ModelStates {
 		if state == nil || !metaADRejectionError(state.LastError) {
@@ -339,11 +337,8 @@ func metaADClearRejectionLeftovers(auth *Auth, now time.Time) bool {
 		modelReset = true
 	}
 	if modelReset {
+		// With model states present the aggregate follows them, as after any model-scoped result.
 		updateAggregatedAvailability(auth, now)
-		if keepCooldown {
-			auth.Unavailable = prevUnavailable
-			auth.NextRetryAfter = prevRetryAfter
-		}
 		changed = true
 	}
 	return changed
