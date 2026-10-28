@@ -124,6 +124,9 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
 		return false
 	}
+	if due, tracked := metaAutoDisableRefreshDue(a); tracked {
+		return due
+	}
 	if evaluator, ok := a.Runtime.(RefreshEvaluator); ok && evaluator != nil {
 		return evaluator.ShouldRefresh(now, a)
 	}
@@ -838,6 +841,9 @@ func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, e
 	if failedToken != "" {
 		m.markRejectedAccessToken(auth.ID, failedToken)
 	}
+	if m.metaAutoDisableOnUnauthorized(auth, failedToken) {
+		return auth, false
+	}
 	if alreadyTried || !authHasRefreshCredential(auth) || hasUnauthorizedAuthFailure(auth) {
 		return auth, false
 	}
@@ -982,6 +988,10 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		}
 	}
 
+	if m.metaAutoDisablePreRefresh(auth, forceRefresh) {
+		return nil, errMetaAutoDisableConfirmed
+	}
+
 	base := auth.Clone()
 	updated, err := exec.Refresh(ctx, base.Clone())
 	now := time.Now()
@@ -1016,6 +1026,22 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 			}
 			if hasUnauthorizedAuthFailure(current) && !forceRefresh {
 				m.mu.Unlock()
+				return nil, err
+			}
+			// Meta auto-disable classifies the failure before the generic branches below.
+			if handled, changed := m.metaAutoDisableOnRefreshError(current, err, forceRefresh, now); handled {
+				if changed {
+					current.Generation++
+					current.UpdatedAt = now
+					m.auths[id] = current
+					if m.scheduler != nil {
+						m.scheduler.upsertAuth(current.Clone())
+					}
+				}
+				m.mu.Unlock()
+				if changed {
+					m.queueRefreshReschedule(id)
+				}
 				return nil, err
 			}
 			wasTerminalUnauthorized := hasUnauthorizedAuthFailure(current)
@@ -1161,6 +1187,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	if saved == nil {
 		return nil, fmt.Errorf("auth %s not found", id)
 	}
+	saved = m.metaAutoDisableAfterRefresh(saved, auth, failedAccessToken)
 	targetAuth := saved
 	supportedModels, regEpoch := registry.GetGlobalRegistry().GetModelsAndEpochForClient(id)
 	projections := make([]registry.ClientModelProjection, 0, len(supportedModels))

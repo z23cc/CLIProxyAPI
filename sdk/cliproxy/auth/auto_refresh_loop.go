@@ -421,6 +421,11 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 		return auth.NextRefreshAfter, true
 	}
 
+	// Meta has no refresh lead: keep a due auto-disable confirmation in the loop.
+	if next, schedule, tracked := metaAutoDisableScheduleAt(now, auth); tracked {
+		return next, schedule
+	}
+
 	if siwcDueAt, hasSIWC, _ := CodexSIWCNeedsRefresh(auth, now); hasSIWC {
 		minDue := siwcDueAt
 		if outerDueAt, hasOuter, _ := CodexOuterNeedsRefresh(auth, now); hasOuter && outerDueAt.Before(minDue) {

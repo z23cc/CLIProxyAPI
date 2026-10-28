@@ -1624,6 +1624,7 @@ func (m *Manager) PrepareRequestAuth(ctx context.Context, preparer RequestAuthPr
 	base := target.Clone()
 	updated, errPrepare := preparer.PrepareRequestAuth(ctx, base.Clone())
 	if errPrepare != nil {
+		m.metaAutoDisableOnPrepareError(target, errPrepare)
 		return auth, errPrepare
 	}
 	if updated == nil {

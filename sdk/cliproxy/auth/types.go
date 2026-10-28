@@ -124,6 +124,10 @@ type Auth struct {
 	// cooldowns can still be cleared by any success.
 	cooldownRecordedSeq uint64 `json:"-"`
 
+	// metaAD is the in-memory Meta auto-disable state (see meta_auto_disable.go).
+	// It is a value type, so Clone copies it, and it is never persisted.
+	metaAD metaAutoDisableState `json:"-"`
+
 	recentRequests recentRequestRing `json:"-"`
 	indexAssigned  bool              `json:"-"`
 	// fileSnapshotPath and fileSnapshotDigest bind an unversioned file-synthesized

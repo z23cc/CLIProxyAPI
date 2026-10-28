@@ -830,6 +830,10 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if hasUnauthorizedAuthFailure(auth) {
 		return true, blockReasonOther, time.Time{}
 	}
+	// A Meta credential awaiting auto-disable confirmation is blocked for every model.
+	if metaADBlocks(auth) {
+		return true, blockReasonOther, time.Time{}
+	}
 	if exp, ok := auth.AccessTokenExpirationTime(); ok && !exp.IsZero() && !exp.After(now) {
 		return true, blockReasonOther, time.Time{}
 	}

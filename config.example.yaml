@@ -193,6 +193,12 @@ routing:
   # Ignored when routing.session-affinity is false.
   session-affinity-rebind-on: "any"
 
+  # Automatically stop using Meta credentials (from auth files, not meta-api-key entries) whose
+  # API key was rejected and can no longer be minted from the dca_token. Off by default; hot-reloaded.
+  # meta-auto-disable:
+  #   enabled: false
+  #   max-per-hour: 20 # cap on automatic disables per rolling hour (default 20)
+
   # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
   force-model-prefix: false
 

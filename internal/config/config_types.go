@@ -487,6 +487,30 @@ type RoutingConfig struct {
 	//     auth errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
 	// Ignored when SessionAffinity is false.
 	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
+
+	// MetaAutoDisable configures automatic disabling of Meta credentials whose key can no longer be minted.
+	MetaAutoDisable MetaAutoDisableConfig `yaml:"meta-auto-disable,omitempty" json:"meta-auto-disable,omitempty"`
+}
+
+// DefaultMetaAutoDisableMaxPerHour is the hourly disable cap used when max-per-hour is unset or non-positive.
+const DefaultMetaAutoDisableMaxPerHour = 20
+
+// MetaAutoDisableConfig controls the automatic disabling of dead Meta credentials.
+type MetaAutoDisableConfig struct {
+	// Enabled turns the feature on. Default: false.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+
+	// MaxPerHour caps how many credentials may be auto-disabled per rolling hour.
+	// Values <= 0 fall back to DefaultMetaAutoDisableMaxPerHour.
+	MaxPerHour int `yaml:"max-per-hour,omitempty" json:"max-per-hour,omitempty"`
+}
+
+// EffectiveMaxPerHour returns the hourly disable cap with the default applied.
+func (c MetaAutoDisableConfig) EffectiveMaxPerHour() int {
+	if c.MaxPerHour <= 0 {
+		return DefaultMetaAutoDisableMaxPerHour
+	}
+	return c.MaxPerHour
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
