@@ -546,3 +546,80 @@ func TestMetaAutoDisable_FailedSaveIsNotPublished(t *testing.T) {
 	metaADTestRequireMarkers(t, metaADTestReadJSON(t, dir, metaADTestPrimaryFile), before, after)
 	metaADTestReloadedNeverSelected(t, store, metaADTestPrimaryFile)
 }
+
+func TestMetaAutoDisable_ForcedRefreshMintSuccessWithFailedSaveDoesNotDisableLater(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("cannot make the credential file unwritable on this platform or user")
+	}
+	dir := t.TempDir()
+	metaADTestWriteFile(t, dir, metaADTestPrimaryFile, metaADTestPrimaryMetadata())
+	metaADTestWriteFile(t, dir, metaADTestBackupFile, metaADTestBackupMetadata())
+	store := NewFileTokenStore()
+	store.SetBaseDir(dir)
+	exec := newMetaADTestExecutor()
+	m := metaADTestManager(t, store, exec, metaADTestListed(t, store))
+	metaADTestEnterPending(t, m, exec, metaADTestPrimaryFile)
+
+	path := filepath.Join(dir, metaADTestPrimaryFile)
+	if err := os.Chmod(path, 0o400); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+
+	// The confirmation is rejected but the disable cannot be saved: confirmed, not disabled.
+	_, _ = m.ForceRefreshAuth(context.Background(), metaADTestPrimaryFile)
+	// The mint now works, but the save of the new key fails too.
+	mint := func(key string) func(*coreauth.Auth) (*coreauth.Auth, error) {
+		return func(a *coreauth.Auth) (*coreauth.Auth, error) {
+			a.Metadata["api_key"] = key
+			a.Metadata["access_token"] = key
+			return a, nil
+		}
+	}
+	exec.mu.Lock()
+	exec.refresh = mint("minted-1")
+	exec.mu.Unlock()
+	if _, err := m.ForceRefreshAuth(context.Background(), metaADTestPrimaryFile); err == nil {
+		t.Fatalf("ForceRefreshAuth error = nil, want the failed save of the minted key")
+	}
+	got, _ := m.GetByID(metaADTestPrimaryFile)
+	if got.Disabled || got.Status == coreauth.StatusDisabled {
+		t.Fatalf("a credential whose mint just worked was disabled")
+	}
+
+	// The directory recovers and the mint works again: the credential is restored.
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	exec.mu.Lock()
+	exec.refresh = mint("minted-2")
+	exec.mu.Unlock()
+	if _, err := m.ForceRefreshAuth(context.Background(), metaADTestPrimaryFile); err != nil {
+		t.Fatalf("ForceRefreshAuth: %v", err)
+	}
+
+	file := metaADTestReadJSON(t, dir, metaADTestPrimaryFile)
+	if file["api_key"] != "minted-2" {
+		t.Fatalf("file api_key = %v, want the new key", file["api_key"])
+	}
+	if file["disabled"] == true || file["disabled_by"] != nil {
+		t.Fatalf("the file was disabled: %v", file)
+	}
+	got, _ = m.GetByID(metaADTestPrimaryFile)
+	if got.Disabled || got.Unavailable {
+		t.Fatalf("Disabled=%v Unavailable=%v, want the credential selectable again", got.Disabled, got.Unavailable)
+	}
+	served := false
+	for i := 0; i < 4; i++ {
+		payload, err := metaADTestExecute(m)
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if payload == metaADTestPrimaryFile {
+			served = true
+		}
+	}
+	if !served {
+		t.Fatalf("the restored primary never served a request")
+	}
+}

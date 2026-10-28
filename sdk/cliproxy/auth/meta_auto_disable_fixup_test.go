@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"runtime"
 	"sync"
@@ -1406,8 +1407,9 @@ func metaADFxConfirmedUnsaved(t *testing.T) (*Manager, *metaADFxExecutor, *metaA
 	if got := metaADFxGet(t, m, metaADFxPrimaryID); got.Disabled {
 		t.Fatalf("precondition: the failed save was published")
 	}
-	if n := m.metaADFxLimiterSlots(); n != 0 {
-		t.Fatalf("precondition: limiter holds %d slots after a failed save, want 0", n)
+	// A failed save keeps its slot: the store may have landed the disable locally already.
+	if n := m.metaADFxLimiterSlots(); n != 1 {
+		t.Fatalf("precondition: limiter holds %d slots after a failed save, want 1", n)
 	}
 	store.setFail(false)
 	return m, exec, store
@@ -1418,6 +1420,7 @@ func TestMetaAutoDisableFixup3_ForcedRefreshCompletesPendingWrite(t *testing.T) 
 	t.Run("mint_rejected_again_writes", func(t *testing.T) {
 		m, exec, store := metaADFxConfirmedUnsaved(t)
 		exec.enqueue(metaADFxMintErr(http.StatusForbidden))
+		slots := m.metaADFxLimiterSlots()
 
 		if _, err := m.ForceRefreshAuth(context.Background(), metaADFxPrimaryID); err == nil {
 			t.Fatalf("ForceRefreshAuth error = nil, want the rejected mint")
@@ -1427,14 +1430,16 @@ func TestMetaAutoDisableFixup3_ForcedRefreshCompletesPendingWrite(t *testing.T) 
 		if last := store.lastSaved(); last == nil || !last.Disabled || last.Metadata["disabled_by"] != "cliproxyapi" {
 			t.Fatalf("last Save = %+v, want the disabled credential", last)
 		}
-		if n := m.metaADFxLimiterSlots(); n != 1 {
-			t.Fatalf("limiter slots = %d, want exactly 1 for the one written disable", n)
+		// The write attempt reserves one slot; the earlier failed save kept its own.
+		if n := m.metaADFxLimiterSlots(); n != slots+1 {
+			t.Fatalf("limiter slots = %d, want %d (one more for the write)", n, slots+1)
 		}
 	})
 
 	t.Run("mint_succeeds_rescues", func(t *testing.T) {
 		m, exec, store := metaADFxConfirmedUnsaved(t)
 		saves := len(store.saved)
+		slots := m.metaADFxLimiterSlots()
 
 		if _, err := m.ForceRefreshAuth(context.Background(), metaADFxPrimaryID); err != nil {
 			t.Fatalf("ForceRefreshAuth: %v", err)
@@ -1456,9 +1461,193 @@ func TestMetaAutoDisableFixup3_ForcedRefreshCompletesPendingWrite(t *testing.T) 
 			}
 		}
 		store.mu.Unlock()
-		if n := m.metaADFxLimiterSlots(); n != 0 {
-			t.Fatalf("limiter slots = %d, want 0 (nothing was disabled)", n)
+		if n := m.metaADFxLimiterSlots(); n != slots {
+			t.Fatalf("limiter slots = %d, want unchanged %d (nothing was disabled)", n, slots)
 		}
 		_ = exec
+	})
+}
+
+func metaADFxNetworkErr() error {
+	return fmt.Errorf("meta executor: mint API key failed: %w", &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")})
+}
+
+// metaADFxRequireNoDisableSaved fails if any Save carried a disable.
+func metaADFxRequireNoDisableSaved(t *testing.T, store *metaADFxStore) {
+	t.Helper()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for _, saved := range store.saved {
+		if saved.Disabled || saved.Metadata["disabled_by"] != nil {
+			t.Fatalf("a disable was written: %+v", saved.Metadata)
+		}
+	}
+}
+
+// metaADFxForcedRescueWithFailedKeySave builds a confirmed credential whose disable could
+// not be saved, then runs an operator-forced refresh whose mint succeeds while the store
+// fails the save of the minted key. It asserts the dead verdict was dropped.
+func metaADFxForcedRescueWithFailedKeySave(t *testing.T) (*Manager, *metaADFxExecutor, *metaADFxStore) {
+	t.Helper()
+	m, exec, store := metaADFxConfirmedUnsaved(t)
+	slots := m.metaADFxLimiterSlots()
+
+	store.setFail(true)
+	before := time.Now()
+	if _, err := m.ForceRefreshAuth(context.Background(), metaADFxPrimaryID); err == nil {
+		t.Fatalf("ForceRefreshAuth error = nil, want the failed save of the minted key")
+	}
+	after := time.Now()
+
+	got := metaADFxGet(t, m, metaADFxPrimaryID)
+	if got.Disabled || got.Status == StatusDisabled {
+		t.Fatalf("a credential whose mint just worked was disabled")
+	}
+	metaADFxRequireTracked(t, got, metaADStateRetry, metaADReasonMintRejected)
+	if raw := metaADFxRaw(m, metaADFxPrimaryID); raw.confirmed {
+		t.Fatalf("confirmed = true, want the dead verdict dropped")
+	}
+	d := metaADRetryDelay(1)
+	if got.NextRefreshAfter.Before(before.Add(d-time.Second)) || got.NextRefreshAfter.After(after.Add(d+time.Second)) {
+		t.Fatalf("NextRefreshAfter = %v, want about now+%v", got.NextRefreshAfter, d)
+	}
+	if key := metaADKey(got); key != "dead-key-0" {
+		t.Fatalf("installed key = %q, want the old key after the failed save", key)
+	}
+	if n := m.metaADFxLimiterSlots(); n != slots {
+		t.Fatalf("limiter slots = %d, want unchanged %d", n, slots)
+	}
+	metaADFxRequireNoDisableSaved(t, store)
+	store.setFail(false)
+	return m, exec, store
+}
+
+func TestMetaAutoDisableFixup4_ForcedRescueWithFailedKeySaveDropsTheDeadVerdict(t *testing.T) {
+	cases := []struct {
+		name  string
+		queue error
+		check func(t *testing.T, m *Manager, store *metaADFxStore, attemptsBefore int, before, after time.Time)
+	}{
+		{
+			name: "mint_succeeds_restores",
+			check: func(t *testing.T, m *Manager, store *metaADFxStore, _ int, _, _ time.Time) {
+				got := metaADFxGet(t, m, metaADFxPrimaryID)
+				metaADFxRequireNotTracked(t, got)
+				if got.Disabled {
+					t.Fatalf("a rescued credential was disabled")
+				}
+				metaADFxRequireSelectable(t, got, metaADFxModels...)
+				if key := metaADKey(got); key != "fx-minted-2" {
+					t.Fatalf("key = %q, want the key minted by the job", key)
+				}
+				metaADFxRequireNoDisableSaved(t, store)
+			},
+		},
+		{
+			name:  "mint_rejected_writes",
+			queue: metaADFxMintErr(http.StatusUnauthorized),
+			check: func(t *testing.T, m *Manager, store *metaADFxStore, _ int, _, _ time.Time) {
+				metaADFxRequireDisabledMarkers(t, metaADFxGet(t, m, metaADFxPrimaryID), metaADReasonMintRejected)
+				if last := store.lastSaved(); last == nil || !last.Disabled {
+					t.Fatalf("last Save = %+v, want the disabled credential", last)
+				}
+			},
+		},
+		{
+			name:  "transient_failure_keeps_retrying",
+			queue: metaADFxNetworkErr(),
+			check: func(t *testing.T, m *Manager, store *metaADFxStore, attemptsBefore int, before, after time.Time) {
+				got := metaADFxGet(t, m, metaADFxPrimaryID)
+				metaADFxRequireTracked(t, got, metaADStateRetry, metaADReasonMintRejected)
+				raw := metaADFxRaw(m, metaADFxPrimaryID)
+				if raw.confirmed || raw.attempts != attemptsBefore+1 {
+					t.Fatalf("confirmed=%v attempts=%d, want unconfirmed and %d", raw.confirmed, raw.attempts, attemptsBefore+1)
+				}
+				d := metaADRetryDelay(raw.attempts)
+				if got.NextRefreshAfter.Before(before.Add(d-time.Second)) || got.NextRefreshAfter.After(after.Add(d+time.Second)) {
+					t.Fatalf("NextRefreshAfter = %v, want about now+%v", got.NextRefreshAfter, d)
+				}
+				metaADFxRequireNoDisableSaved(t, store)
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, exec, store := metaADFxForcedRescueWithFailedKeySave(t)
+			if tc.queue != nil {
+				exec.enqueue(tc.queue)
+			}
+			attemptsBefore := metaADFxRaw(m, metaADFxPrimaryID).attempts
+			l := newAuthAutoRefreshLoop(m, time.Second, 1)
+			mints := exec.refreshCount()
+			metaADFxMakeDue(m, metaADFxPrimaryID)
+
+			before := time.Now()
+			if !metaADFxRunDueJob(t, m, l, metaADFxPrimaryID) {
+				t.Fatalf("no refresh job was dispatched")
+			}
+			after := time.Now()
+
+			// The job mints again instead of settling a stale verdict into a disable.
+			if got := exec.refreshCount(); got != mints+1 {
+				t.Fatalf("Refresh calls = %d, want %d: the job must mint", got, mints+1)
+			}
+			tc.check(t, m, store, attemptsBefore, before, after)
+		})
+	}
+}
+
+func TestMetaAutoDisableFixup4_ForcedRescueFailedSaveForNonMintReasons(t *testing.T) {
+	t.Run("new_key_rejected_becomes_mint_rejected", func(t *testing.T) {
+		store := newMetaADFxStore()
+		exec := newMetaADFxExecutor()
+		m := newMetaADFxManager(t, true, store, exec, metaADFxPrimary())
+		m.mu.Lock()
+		live := m.auths[metaADFxPrimaryID]
+		metaADEnterPending(live, metaADReasonNewKeyRejected, time.Now())
+		metaADMarkConfirmed(live, time.Now())
+		m.mu.Unlock()
+		metaADFxMakeDue(m, metaADFxPrimaryID)
+
+		store.setFail(true)
+		if _, err := m.ForceRefreshAuth(context.Background(), metaADFxPrimaryID); err == nil {
+			t.Fatalf("ForceRefreshAuth error = nil, want the failed save")
+		}
+
+		got := metaADFxGet(t, m, metaADFxPrimaryID)
+		metaADFxRequireTracked(t, got, metaADStateRetry, metaADReasonMintRejected)
+		if raw := metaADFxRaw(m, metaADFxPrimaryID); raw.confirmed {
+			t.Fatalf("confirmed = true, want the dead verdict dropped so the next job mints")
+		}
+		if got.Disabled {
+			t.Fatalf("credential was disabled")
+		}
+		metaADFxRequireNoDisableSaved(t, store)
+	})
+
+	t.Run("no_dca_token_stays_no_dca_token", func(t *testing.T) {
+		store := newMetaADFxStore()
+		exec := newMetaADFxExecutor()
+		m := newMetaADFxManager(t, true, store, exec, metaADFxKeyAuth(metaADFxPrimaryID, "dead-key-0", ""))
+		m.mu.Lock()
+		live := m.auths[metaADFxPrimaryID]
+		metaADEnterPending(live, metaADReasonNoDCAToken, time.Now())
+		metaADMarkConfirmed(live, time.Now())
+		m.mu.Unlock()
+		metaADFxMakeDue(m, metaADFxPrimaryID)
+
+		store.setFail(true)
+		_, err := m.ForceRefreshAuth(context.Background(), metaADFxPrimaryID)
+		t.Logf("ForceRefreshAuth error = %v", err)
+
+		got := metaADFxGet(t, m, metaADFxPrimaryID)
+		if got.Disabled {
+			t.Fatalf("credential was disabled")
+		}
+		metaADFxRequireTracked(t, got, metaADStateRetry, metaADReasonNoDCAToken)
+		if raw := metaADFxRaw(m, metaADFxPrimaryID); raw.confirmed {
+			t.Fatalf("confirmed = true, want retry")
+		}
+		metaADFxRequireNoDisableSaved(t, store)
 	})
 }

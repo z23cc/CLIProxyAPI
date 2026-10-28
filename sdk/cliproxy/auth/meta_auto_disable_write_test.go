@@ -33,6 +33,10 @@ type metaADWrStore struct {
 	blockOn bool
 	entered chan struct{}
 	release chan struct{}
+	// localThenFail models a store that writes the watched local file first and uploads
+	// afterwards: a Save carrying the disable markers lands in localFiles and then fails.
+	localThenFail bool
+	localFiles    map[string]map[string]any
 }
 
 func (s *metaADWrStore) List(context.Context) ([]*Auth, error) { return nil, nil }
@@ -48,6 +52,13 @@ func (s *metaADWrStore) Save(_ context.Context, a *Auth) (string, error) {
 	fail := s.failures > 0
 	if fail {
 		s.failures--
+	}
+	if s.localThenFail && meta["disabled"] == true {
+		if s.localFiles == nil {
+			s.localFiles = map[string]map[string]any{}
+		}
+		s.localFiles[a.ID] = meta
+		fail = true
 	}
 	block := s.blockOn && meta["disabled"] == true
 	entered, release := s.entered, s.release
@@ -147,6 +158,16 @@ func metaADWrCraftConfirmed(t *testing.T, m *Manager, id, reason string) {
 		m.scheduler.upsertAuth(live.Clone())
 	}
 	m.mu.Unlock()
+}
+
+// metaADWrEpisode returns the episode the credential is in right now (zero when untracked).
+func metaADWrEpisode(t *testing.T, m *Manager, id string) metaADEpisode {
+	t.Helper()
+	live, ok := m.GetByID(id)
+	if !ok {
+		return metaADEpisode{}
+	}
+	return live.metaAD.episode()
 }
 
 func metaADWrLimiterStamps(m *Manager) int {
@@ -332,9 +353,9 @@ func TestMetaAutoDisableWrite_AlreadyDisabledIsNotOverwritten(t *testing.T) {
 			}
 			savesBefore := len(store.markerSaves())
 
-			m.metaAutoDisableWrite(metaADPrimaryID)
+			m.metaAutoDisableWrite(metaADPrimaryID, metaADWrEpisode(t, m, metaADPrimaryID))
 			metaADMakeDue(m, metaADPrimaryID)
-			m.metaAutoDisableSettle(metaADPrimaryID)
+			m.metaAutoDisableSettle(metaADPrimaryID, metaADWrEpisode(t, m, metaADPrimaryID))
 
 			got := metaADGet(t, m, metaADPrimaryID)
 			if !got.Disabled || got.StatusMessage != "disabled by someone else" {
@@ -374,7 +395,7 @@ func TestMetaAutoDisableWrite_CredentialChangedDuringWriteIsNotDisabled(t *testi
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		m.metaAutoDisableWrite(metaADPrimaryID)
+		m.metaAutoDisableWrite(metaADPrimaryID, metaADWrEpisode(t, m, metaADPrimaryID))
 	}()
 	// The write decided to write and is now blocked in Modify's gate acquisition.
 	metaADWrWaitForGateWaiter(m, metaADPrimaryID, 1)
@@ -421,7 +442,7 @@ func TestMetaAutoDisableWrite_RegistrationChangedIsNotDisabled(t *testing.T) {
 		t.Fatalf("precondition: registration epoch did not change")
 	}
 
-	m.metaAutoDisableWrite(metaADPrimaryID)
+	m.metaAutoDisableWrite(metaADPrimaryID, metaADWrEpisode(t, m, metaADPrimaryID))
 
 	got := metaADGet(t, m, metaADPrimaryID)
 	if got.Disabled || len(store.markerSaves()) != 0 || metaADWrLimiterStamps(m) != 0 {
@@ -441,7 +462,7 @@ func TestMetaAutoDisableWrite_StaleRecordedEpochWritesNothing(t *testing.T) {
 	live.RegistrationEpoch = live.metaAD.epoch + 3
 	m.mu.Unlock()
 
-	m.metaAutoDisableWrite(metaADPrimaryID)
+	m.metaAutoDisableWrite(metaADPrimaryID, metaADWrEpisode(t, m, metaADPrimaryID))
 
 	got := metaADGet(t, m, metaADPrimaryID)
 	if got.Disabled || len(store.markerSaves()) != 0 {
@@ -515,7 +536,7 @@ func TestMetaAutoDisableWrite_WriteFailureKeepsCredentialBlockedAndRetriesLater(
 		t.Fatalf("Execute: %v", err)
 	}
 
-	requireRetryLater := func(label string, before, after time.Time) {
+	requireRetryLater := func(label string, before, after time.Time, wantStamps int) {
 		t.Helper()
 		got := metaADGet(t, m, metaADPrimaryID)
 		if got.Disabled {
@@ -530,8 +551,9 @@ func TestMetaAutoDisableWrite_WriteFailureKeepsCredentialBlockedAndRetriesLater(
 			t.Fatalf("%s: hasUnauthorizedAuthFailure = true", label)
 		}
 		metaADRequireBlockedEverywhere(t, got)
-		if stamps := metaADWrLimiterStamps(m); stamps != 0 {
-			t.Fatalf("%s: limiter stamps = %d, want the slot released", label, stamps)
+		// A failed save keeps its cap slot: the local file may already carry the disable.
+		if stamps := metaADWrLimiterStamps(m); stamps != wantStamps {
+			t.Fatalf("%s: limiter stamps = %d, want %d (a failed save keeps its slot)", label, stamps, wantStamps)
 		}
 	}
 
@@ -539,7 +561,7 @@ func TestMetaAutoDisableWrite_WriteFailureKeepsCredentialBlockedAndRetriesLater(
 	store.failNext(2)
 	before := time.Now()
 	metaADConfirmDue(m, metaADPrimaryID)
-	requireRetryLater("confirmation", before, time.Now())
+	requireRetryLater("confirmation", before, time.Now(), 1)
 	if got := exec.RefreshCalls(); got != 2 {
 		t.Fatalf("Refresh calls = %d, want 2 (request mint + confirmation mint)", got)
 	}
@@ -572,7 +594,7 @@ func TestMetaAutoDisableWrite_WriteFailureKeepsCredentialBlockedAndRetriesLater(
 			t.Fatalf("loop run 1 %s: NextRefreshAfter = %v, want about now+%v", label, next, metaADWriteRetryDelay)
 		}
 	}
-	requireRetryLater("loop run 1", before, after)
+	requireRetryLater("loop run 1", before, after, 2)
 	if got := exec.RefreshCalls(); got != 2 {
 		t.Fatalf("Refresh calls = %d, want 2 (a pending write never mints)", got)
 	}
@@ -634,7 +656,9 @@ func TestMetaAutoDisableWrite_SwitchOffNeverWrites(t *testing.T) {
 		metaADWrCraftConfirmed(t, m, metaADPrimaryID, metaADReasonMintRejected)
 		m.SetConfig(metaADWrConfig(false, 0))
 
-		m.metaAutoDisableWrite(metaADPrimaryID)
+		m.metaAutoDisableWrite(metaADPrimaryID, metaADWrEpisode(t, m, metaADPrimaryID))
+		// With the switch off the confirmed credential is released and selectable again.
+		metaADWrRequireReleased(t, m, store, metaADPrimaryID)
 		metaADConfirmDue(m, metaADPrimaryID)
 
 		if got := metaADGet(t, m, metaADPrimaryID); got.Disabled {
@@ -797,7 +821,7 @@ func TestMetaAutoDisableWrite_HourlyCapHoldsBackAndRecovers(t *testing.T) {
 
 	before := time.Now()
 	for _, id := range ids {
-		m.metaAutoDisableWrite(id)
+		m.metaAutoDisableWrite(id, metaADWrEpisode(t, m, id))
 	}
 	after := time.Now()
 
@@ -837,7 +861,7 @@ func TestMetaAutoDisableWrite_HourlyCapHoldsBackAndRecovers(t *testing.T) {
 	m.metaADLimiter.capLoggedAt = time.Now().Add(-2 * metaADCapWindow)
 	m.metaADLimiter.mu.Unlock()
 	metaADWrCraftConfirmed(t, m, "d4-mint", metaADReasonMintRejected)
-	m.metaAutoDisableWrite("d4-mint")
+	m.metaAutoDisableWrite("d4-mint", metaADWrEpisode(t, m, "d4-mint"))
 	if got := capErrors(); got != 2 {
 		t.Fatalf("cap error log lines after the log window aged = %d, want 2", got)
 	}
@@ -918,7 +942,7 @@ func TestMetaAutoDisableWrite_ZeroMaxPerHourMeansTwenty(t *testing.T) {
 	m := newMetaADWrManager(t, metaADWrConfig(true, 0), store, exec, false, auths...)
 	for _, a := range auths {
 		metaADWrCraftConfirmed(t, m, a.ID, metaADReasonNewKeyRejected)
-		m.metaAutoDisableWrite(a.ID)
+		m.metaAutoDisableWrite(a.ID, metaADWrEpisode(t, m, a.ID))
 	}
 	disabled, capped := 0, 0
 	for _, a := range auths {
@@ -992,7 +1016,7 @@ func TestMetaAutoDisableWrite_EarlyChecksKeepCapAndGateOutOfIrrelevantWrites(t *
 
 	// Fill the one-slot cap with a real write.
 	metaADWrCraftConfirmed(t, m, written.ID, metaADReasonNewKeyRejected)
-	m.metaAutoDisableWrite(written.ID)
+	m.metaAutoDisableWrite(written.ID, metaADWrEpisode(t, m, written.ID))
 	if !metaADGet(t, m, written.ID).Disabled || metaADWrLimiterStamps(m) != 1 {
 		t.Fatalf("precondition: first credential not written or cap not full (stamps=%d)", metaADWrLimiterStamps(m))
 	}
@@ -1023,17 +1047,28 @@ func TestMetaAutoDisableWrite_EarlyChecksKeepCapAndGateOutOfIrrelevantWrites(t *
 		a := metaADGet(t, m, id)
 		return snap{a.Disabled, a.Status, a.StatusMessage, a.NextRefreshAfter, a.metaAD}
 	}
-	ids := []string{pending.ID, healthy.ID, configKey.ID, disabled.ID, switchOff.ID}
+	ids := []string{pending.ID, healthy.ID, configKey.ID, disabled.ID}
 	before := map[string]snap{}
 	for _, id := range ids {
 		before[id] = snapshot(id)
 	}
 
 	for _, id := range ids[:4] {
-		m.metaAutoDisableWrite(id)
+		m.metaAutoDisableWrite(id, metaADWrEpisode(t, m, id))
 	}
 	m.SetConfig(metaADWrConfig(false, 1))
-	m.metaAutoDisableWrite(switchOff.ID)
+	m.metaAutoDisableWrite(switchOff.ID, metaADWrEpisode(t, m, switchOff.ID))
+
+	// (d) With the switch off the confirmed credential is released from the feature: tracking
+	// and its own block are gone, nothing is written, and it never reached the cap.
+	released := metaADGet(t, m, switchOff.ID)
+	if released.metaAD.state != "" || released.Unavailable || released.Status == StatusError || released.LastError != nil ||
+		released.StatusMessage != "" || !released.NextRefreshAfter.IsZero() || released.Disabled || hasUnauthorizedAuthFailure(released) {
+		t.Fatalf("switch-off credential not released: %+v", released)
+	}
+	if blocked, _, _ := isAuthBlockedForModel(released, metaADModelA, time.Now()); blocked {
+		t.Fatalf("released credential still blocked")
+	}
 
 	for _, id := range ids {
 		if got := snapshot(id); got != before[id] {
@@ -1109,9 +1144,9 @@ func TestMetaAutoDisableWrite_ConfirmedStateIsExposedAsPendingEvenAfterRetryOrCa
 			m := newMetaADWrManager(t, metaADWrConfig(true, 1), store, exec, false,
 				metaADWrFileAuth("a1-written", "dead-a1", "dca:a1"), metaADWrFileAuth("b2-capped", "dead-b2", dca))
 			metaADWrCraftConfirmed(t, m, "a1-written", metaADReasonNewKeyRejected)
-			m.metaAutoDisableWrite("a1-written")
+			m.metaAutoDisableWrite("a1-written", metaADWrEpisode(t, m, "a1-written"))
 			metaADWrCraftConfirmed(t, m, "b2-capped", reason)
-			m.metaAutoDisableWrite("b2-capped")
+			m.metaAutoDisableWrite("b2-capped", metaADWrEpisode(t, m, "b2-capped"))
 			state, _, _, ok := metaADGet(t, m, "b2-capped").MetaAutoDisableStatus()
 			if !ok || state != metaADStateCapped {
 				t.Fatalf("precondition: state = %q ok=%v, want capped", state, ok)
@@ -1129,95 +1164,85 @@ func TestMetaAutoDisableWrite_ConfirmedStateIsExposedAsPendingEvenAfterRetryOrCa
 	}
 }
 
-func TestMetaAutoDisableWrite_AfterSkippedWriteKeepsRetryDeadline(t *testing.T) {
-	t.Run("end to end, switch turned off while the write waits for the gate", func(t *testing.T) {
-		store := &metaADWrStore{}
-		exec := newMetaADTestExecutor()
-		m := newMetaADWrManager(t, metaADWrConfig(true, 0), store, exec, false,
-			metaADWrFileAuth(metaADPrimaryID, "dead-key-0", "dca:primary"))
-		metaADWrCraftConfirmed(t, m, metaADPrimaryID, metaADReasonMintRejected)
-
-		release := m.lockAuthMutation(metaADPrimaryID)
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			m.metaAutoDisableWrite(metaADPrimaryID)
-		}()
-		metaADWrWaitForGateWaiter(m, metaADPrimaryID, 1)
-		// The edit will skip on the switch guard; the deadline has expired meanwhile, as the
-		// refresh worker's job marker would leave it.
-		m.SetConfig(metaADWrConfig(false, 0))
-		m.mu.Lock()
-		m.auths[metaADPrimaryID].NextRefreshAfter = time.Now().Add(-time.Second)
-		m.mu.Unlock()
-		before := time.Now()
-		release()
-		<-done
-		after := time.Now()
-
-		got := metaADGet(t, m, metaADPrimaryID)
-		if got.Disabled || len(store.markerSaves()) != 0 {
-			t.Fatalf("disabled=%v marker saves=%d, want nothing written", got.Disabled, len(store.markerSaves()))
-		}
-		if _, _, _, ok := got.MetaAutoDisableStatus(); !ok {
-			t.Fatalf("credential no longer tracked")
-		}
-		metaADRequireDueIn(t, got, before, after, metaADWriteRetryDelay)
-		if hasUnauthorizedAuthFailure(got) {
-			t.Fatalf("hasUnauthorizedAuthFailure = true")
-		}
-		if stamps := metaADWrLimiterStamps(m); stamps != 0 {
-			t.Fatalf("limiter stamps = %d, want 0", stamps)
-		}
-	})
-
-	unit := []struct {
+func TestMetaAutoDisableWrite_AfterSkippedWriteReinstallsDeadlineOnlyWhileConfirmed(t *testing.T) {
+	cases := []struct {
 		name  string
-		setup func(live *Auth, state *metaAutoDisableState)
-		check func(t *testing.T, live *Auth, before Auth, start, end time.Time)
+		setup func(m *Manager, live *Auth, state *metaAutoDisableState)
+		check func(t *testing.T, live *Auth, oldDue, start, end time.Time)
 	}{
-		{"expired deadline gets a new retry time",
-			func(live *Auth, _ *metaAutoDisableState) { live.NextRefreshAfter = time.Now().Add(-time.Second) },
-			func(t *testing.T, live *Auth, _ Auth, start, end time.Time) {
+		{"confirmed with an expired deadline gets a fresh retry time",
+			func(_ *Manager, live *Auth, _ *metaAutoDisableState) {
+				live.NextRefreshAfter = time.Now().Add(-time.Second)
+			},
+			func(t *testing.T, live *Auth, oldDue, start, end time.Time) {
 				metaADRequireDueIn(t, live, start, end, metaADWriteRetryDelay)
+				if live.NextRefreshAfter.Equal(oldDue) {
+					t.Fatalf("deadline unchanged: %v", oldDue)
+				}
 			}},
-		{"future deadline is left alone",
-			func(live *Auth, _ *metaAutoDisableState) { live.NextRefreshAfter = time.Now().Add(3 * time.Minute) },
-			func(t *testing.T, live *Auth, before Auth, _, _ time.Time) {
-				if !live.NextRefreshAfter.Equal(before.NextRefreshAfter) {
-					t.Fatalf("NextRefreshAfter %v -> %v, want unchanged", before.NextRefreshAfter, live.NextRefreshAfter)
+		{"confirmed with a future deadline in the same episode also gets a fresh one",
+			func(_ *Manager, live *Auth, _ *metaAutoDisableState) {
+				live.NextRefreshAfter = time.Now().Add(3 * time.Minute)
+			},
+			func(t *testing.T, live *Auth, oldDue, start, end time.Time) {
+				metaADRequireDueIn(t, live, start, end, metaADWriteRetryDelay)
+				if live.NextRefreshAfter.Equal(oldDue) {
+					t.Fatalf("deadline unchanged: %v", oldDue)
+				}
+			}},
+		{"not confirmed is left alone",
+			func(_ *Manager, live *Auth, _ *metaAutoDisableState) {
+				live.metaAD.confirmed = false
+				live.NextRefreshAfter = time.Now().Add(-time.Second)
+			},
+			func(t *testing.T, live *Auth, oldDue, _, _ time.Time) {
+				if !live.NextRefreshAfter.Equal(oldDue) || live.metaAD.state == "" {
+					t.Fatalf("deadline %v -> %v state=%q, want untouched", oldDue, live.NextRefreshAfter, live.metaAD.state)
+				}
+			}},
+		{"different episode is left alone",
+			func(_ *Manager, live *Auth, state *metaAutoDisableState) {
+				live.NextRefreshAfter = time.Now().Add(-time.Second)
+				state.since = state.since.Add(time.Second)
+			},
+			func(t *testing.T, live *Auth, oldDue, _, _ time.Time) {
+				if !live.NextRefreshAfter.Equal(oldDue) {
+					t.Fatalf("deadline %v -> %v, want unchanged for another episode", oldDue, live.NextRefreshAfter)
 				}
 			}},
 		{"disabled credential with leftover state is cleared",
-			func(live *Auth, _ *metaAutoDisableState) { live.Disabled = true; live.Status = StatusDisabled },
-			func(t *testing.T, live *Auth, _ Auth, _, _ time.Time) {
+			func(_ *Manager, live *Auth, _ *metaAutoDisableState) {
+				live.Disabled = true
+				live.Status = StatusDisabled
+			},
+			func(t *testing.T, live *Auth, _, _, _ time.Time) {
 				if live.metaAD.state != "" {
 					t.Fatalf("raw metaAD = %+v, want cleared", live.metaAD)
 				}
 			}},
-		{"different episode is left alone",
-			func(live *Auth, state *metaAutoDisableState) {
+		{"switch off releases the credential",
+			func(m *Manager, live *Auth, _ *metaAutoDisableState) {
 				live.NextRefreshAfter = time.Now().Add(-time.Second)
-				state.since = state.since.Add(time.Second)
+				m.SetConfig(metaADWrConfig(false, 0))
 			},
-			func(t *testing.T, live *Auth, before Auth, _, _ time.Time) {
-				if !live.NextRefreshAfter.Equal(before.NextRefreshAfter) {
-					t.Fatalf("NextRefreshAfter %v -> %v, want unchanged for another episode", before.NextRefreshAfter, live.NextRefreshAfter)
+			func(t *testing.T, live *Auth, _, _, _ time.Time) {
+				if live.metaAD.state != "" || live.Unavailable || live.LastError != nil || live.Status == StatusError ||
+					!live.NextRefreshAfter.IsZero() || hasUnauthorizedAuthFailure(live) {
+					t.Fatalf("not released: %+v", live)
 				}
 			}},
 	}
-	for _, tc := range unit {
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			exec := newMetaADTestExecutor()
 			m := newMetaADWrManager(t, metaADWrConfig(true, 0), nil, exec, false,
 				metaADWrFileAuth(metaADPrimaryID, "dead-key-0", "dca:primary"))
 			metaADWrCraftConfirmed(t, m, metaADPrimaryID, metaADReasonMintRejected)
-			m.mu.Lock()
+			// Single goroutine: the setup may call SetConfig, which takes m.mu itself.
 			live := m.auths[metaADPrimaryID]
 			state := live.metaAD
-			tc.setup(live, &state)
-			before := Auth{NextRefreshAfter: live.NextRefreshAfter}
-			m.mu.Unlock()
+			tc.setup(m, live, &state)
+			oldDue := live.NextRefreshAfter
 
 			start := time.Now()
 			m.metaADAfterSkippedWrite(metaADPrimaryID, state, start)
@@ -1225,7 +1250,359 @@ func TestMetaAutoDisableWrite_AfterSkippedWriteKeepsRetryDeadline(t *testing.T) 
 
 			m.mu.RLock()
 			defer m.mu.RUnlock()
-			tc.check(t, m.auths[metaADPrimaryID], before, start, end)
+			tc.check(t, m.auths[metaADPrimaryID], oldDue, start, end)
+		})
+	}
+}
+
+// metaADWrRunJob drives one refresh job for id the way the background loop does. It is
+// safe to call from a goroutine (it reports with t.Errorf).
+func metaADWrRunJob(t *testing.T, m *Manager, id string) {
+	ctx := context.Background()
+	l := newAuthAutoRefreshLoop(m, time.Second, 1)
+	l.handleDueAuth(ctx, time.Now(), id)
+	select {
+	case job := <-l.jobs:
+		if m.beginRefreshJob(ctx, job) {
+			_, _ = m.refreshAuthForRequestAtEpoch(ctx, job.id, "", job.registrationEpoch)
+		}
+		m.finishRefreshJob(job, time.Time{}, false)
+	default:
+		t.Errorf("no refresh job enqueued for %s", id)
+	}
+}
+
+// metaADWrRequireReleased asserts the credential fell back to ordinary, selectable state.
+func metaADWrRequireReleased(t *testing.T, m *Manager, store *metaADWrStore, id string) {
+	t.Helper()
+	got := metaADGet(t, m, id)
+	if hasUnauthorizedAuthFailure(got) {
+		t.Fatalf("hasUnauthorizedAuthFailure = true: the synthetic 401 was left terminal")
+	}
+	if got.Unavailable || got.Status == StatusError || got.LastError != nil || got.StatusMessage != "" {
+		t.Fatalf("unavailable=%v status=%v lastErr=%v message=%q, want the block lifted", got.Unavailable, got.Status, got.LastError, got.StatusMessage)
+	}
+	if got.metaAD.state != "" || got.Disabled || !got.NextRefreshAfter.IsZero() {
+		t.Fatalf("metaAD=%+v disabled=%v nextRefresh=%v, want released", got.metaAD, got.Disabled, got.NextRefreshAfter)
+	}
+	if saves := store.markerSaves(); len(saves) != 0 {
+		t.Fatalf("saves with markers = %d, want 0", len(saves))
+	}
+	if stamps := metaADWrLimiterStamps(m); stamps != 0 {
+		t.Fatalf("limiter stamps = %d, want 0", stamps)
+	}
+	if blocked, _, _ := isAuthBlockedForModel(got, metaADModelA, time.Now()); blocked {
+		t.Fatalf("released credential still blocked")
+	}
+	if next, schedule := nextRefreshCheckAt(time.Now(), got, time.Second); schedule || !next.IsZero() {
+		t.Fatalf("nextRefreshCheckAt = (%v, %v), want (zero, false)", next, schedule)
+	}
+}
+
+func TestMetaAutoDisableWrite_SkippedWriteWithSwitchOffReleasesCredentialThroughJobLifecycle(t *testing.T) {
+	t.Run("switch_off_before_the_write_check", func(t *testing.T) {
+		for _, reason := range []string{metaADReasonNewKeyRejected, metaADReasonNoDCAToken} {
+			t.Run(reason, func(t *testing.T) {
+				store := &metaADWrStore{}
+				exec := newMetaADTestExecutor()
+				dca := "dca:primary"
+				if reason == metaADReasonNoDCAToken {
+					dca = ""
+				}
+				m := newMetaADWrManager(t, metaADWrConfig(true, 0), store, exec, true,
+					metaADWrFileAuth(metaADPrimaryID, "dead-key-0", dca))
+				m.mu.Lock()
+				metaADEnterPending(m.auths[metaADPrimaryID], reason, time.Now())
+				m.auths[metaADPrimaryID].NextRefreshAfter = time.Now().Add(-time.Second)
+				m.mu.Unlock()
+
+				release := m.lockAuthMutation(metaADPrimaryID)
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					metaADWrRunJob(t, m, metaADPrimaryID)
+				}()
+				// Settle waits for the gate; the switch goes off before it can mark and write.
+				metaADWrWaitForGateWaiter(m, metaADPrimaryID, 1)
+				m.SetConfig(metaADWrConfig(false, 0))
+				release()
+				<-done
+
+				metaADWrRequireReleased(t, m, store, metaADPrimaryID)
+			})
+		}
+	})
+
+	t.Run("switch_off_while_modify_waits_for_the_gate", func(t *testing.T) {
+		store := &metaADWrStore{}
+		exec := newMetaADTestExecutor()
+		m := newMetaADWrManager(t, metaADWrConfig(true, 0), store, exec, true,
+			metaADWrFileAuth(metaADPrimaryID, "dead-key-0", "dca:primary"))
+		metaADWrCraftConfirmed(t, m, metaADPrimaryID, metaADReasonMintRejected)
+		metaADMakeDue(m, metaADPrimaryID)
+
+		release := m.lockAuthMutation(metaADPrimaryID)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			metaADWrRunJob(t, m, metaADPrimaryID)
+		}()
+		// The credential is confirmed, so Settle skips the gate; the write reserves a slot and
+		// Modify waits for the gate.
+		metaADWrWaitForGateWaiter(m, metaADPrimaryID, 1)
+		m.SetConfig(metaADWrConfig(false, 0))
+		release()
+		<-done
+
+		metaADWrRequireReleased(t, m, store, metaADPrimaryID)
+		if got := exec.RefreshCalls(); got != 0 {
+			t.Fatalf("Refresh calls = %d, want 0", got)
+		}
+	})
+}
+
+func TestMetaAutoDisableWrite_SettleAndWriteIgnoreAnotherEpisode(t *testing.T) {
+	// replaceWithNewEpisode re-logs the credential in (new key) while the caller holds the
+	// gate and starts a fresh pending episode for it. It returns the time it entered pending.
+	replaceWithNewEpisode := func(t *testing.T, m *Manager, confirmed bool) time.Time {
+		t.Helper()
+		replacement := metaADWrFileAuth(metaADPrimaryID, "login-key-9", "dca:login")
+		committed, ok, persistCooldown, err := m.updateInternalLocked(context.Background(), nil, replacement, updateModeReplace)
+		if err != nil || !ok {
+			t.Fatalf("updateInternalLocked = (%v, %v)", ok, err)
+		}
+		entered := time.Now()
+		m.mu.Lock()
+		live := m.auths[metaADPrimaryID]
+		metaADEnterPending(live, metaADReasonNewKeyRejected, entered)
+		if confirmed {
+			metaADMarkConfirmed(live, entered)
+		}
+		m.mu.Unlock()
+		m.finishAuthUpdate(context.Background(), committed, persistCooldown)
+		return entered
+	}
+	requireUntouchedEpisode := func(t *testing.T, m *Manager, store *metaADWrStore, entered time.Time, confirmed bool) {
+		t.Helper()
+		got := metaADGet(t, m, metaADPrimaryID)
+		if got.Disabled || got.metaAD.confirmed != confirmed || got.metaAD.state != metaADStatePending {
+			t.Fatalf("disabled=%v confirmed=%v state=%q, want the new episode untouched", got.Disabled, got.metaAD.confirmed, got.metaAD.state)
+		}
+		delay := metaADConfirmDelay
+		if confirmed {
+			delay = metaADWriteRetryDelay
+		}
+		if got.NextRefreshAfter.Before(entered.Add(delay-time.Second)) || got.NextRefreshAfter.After(entered.Add(delay+time.Second)) {
+			t.Fatalf("NextRefreshAfter = %v, want about %v after the new episode began", got.NextRefreshAfter, delay)
+		}
+		if saves := store.markerSaves(); len(saves) != 0 {
+			t.Fatalf("saves with markers = %d, want 0", len(saves))
+		}
+		if stamps := metaADWrLimiterStamps(m); stamps != 0 {
+			t.Fatalf("limiter stamps = %d, want 0", stamps)
+		}
+	}
+	newPending := func(t *testing.T) (*Manager, *metaADWrStore, metaADEpisode) {
+		store := &metaADWrStore{}
+		m := newMetaADWrManager(t, metaADWrConfig(true, 0), store, newMetaADTestExecutor(), false,
+			metaADWrFileAuth(metaADPrimaryID, "dead-key-0", "dca:primary"))
+		m.mu.Lock()
+		metaADEnterPending(m.auths[metaADPrimaryID], metaADReasonNewKeyRejected, time.Now())
+		m.mu.Unlock()
+		return m, store, metaADWrEpisode(t, m, metaADPrimaryID)
+	}
+
+	t.Run("Settle", func(t *testing.T) {
+		m, store, episodeA := newPending(t)
+		release := m.lockAuthMutation(metaADPrimaryID)
+		entered := replaceWithNewEpisode(t, m, false)
+		release()
+		m.metaAutoDisableSettle(metaADPrimaryID, episodeA)
+		requireUntouchedEpisode(t, m, store, entered, false)
+	})
+
+	t.Run("Write", func(t *testing.T) {
+		m, store, episodeA := newPending(t)
+		release := m.lockAuthMutation(metaADPrimaryID)
+		entered := replaceWithNewEpisode(t, m, true)
+		release()
+		m.metaAutoDisableWrite(metaADPrimaryID, episodeA)
+		requireUntouchedEpisode(t, m, store, entered, true)
+	})
+
+	t.Run("job snapshot taken before the re-login", func(t *testing.T) {
+		m, store, _ := newPending(t)
+		m.mu.Lock()
+		m.auths[metaADPrimaryID].NextRefreshAfter = time.Now().Add(-time.Second)
+		m.mu.Unlock()
+
+		release := m.lockAuthMutation(metaADPrimaryID)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			metaADWrRunJob(t, m, metaADPrimaryID)
+		}()
+		// The job holds episode A and waits in Settle for the gate.
+		metaADWrWaitForGateWaiter(m, metaADPrimaryID, 1)
+		entered := replaceWithNewEpisode(t, m, false)
+		release()
+		<-done
+
+		got := metaADGet(t, m, metaADPrimaryID)
+		if got.Disabled || got.metaAD.confirmed || got.metaAD.state != metaADStatePending {
+			t.Fatalf("disabled=%v confirmed=%v state=%q, want the new episode untouched by the old job", got.Disabled, got.metaAD.confirmed, got.metaAD.state)
+		}
+		if got.NextRefreshAfter.IsZero() {
+			t.Fatalf("NextRefreshAfter is zero: the new pending episode lost its deadline (entered %v)", entered)
+		}
+		if saves := store.markerSaves(); len(saves) != 0 {
+			t.Fatalf("saves with markers = %d, want 0", len(saves))
+		}
+		if stamps := metaADWrLimiterStamps(m); stamps != 0 {
+			t.Fatalf("limiter stamps = %d, want 0", stamps)
+		}
+	})
+}
+
+func TestMetaAutoDisableWrite_RefreshErrorForAnEpisodeStartedMeanwhileIsNotConfirmed(t *testing.T) {
+	store := &metaADWrStore{}
+	exec := newMetaADTestExecutor()
+	exec.enqueue(metaADRefreshResult{err: metaADMintErr(http.StatusUnauthorized)})
+	m := newMetaADWrManager(t, metaADWrConfig(true, 0), store, exec, false,
+		metaADWrFileAuth(metaADPrimaryID, "live-key", "dca:primary"))
+
+	release, wait := metaADBlockedRefresh(t, exec, func() error {
+		_, err := m.ForceRefreshAuth(context.Background(), metaADPrimaryID)
+		return err
+	})
+	// While the forced mint is in flight, a concurrent 401 starts a pending episode.
+	entered := time.Now()
+	m.mu.Lock()
+	metaADEnterPending(m.auths[metaADPrimaryID], metaADReasonMintRejected, entered)
+	m.mu.Unlock()
+	release()
+	if err := wait(); err == nil {
+		t.Fatalf("ForceRefreshAuth error = nil, want the mint error")
+	}
+
+	got := metaADGet(t, m, metaADPrimaryID)
+	metaADRequireTracked(t, got, metaADStatePending, metaADReasonMintRejected)
+	if got.metaAD.confirmed || got.Disabled {
+		t.Fatalf("confirmed=%v disabled=%v, a failure from before the episode must not confirm it", got.metaAD.confirmed, got.Disabled)
+	}
+	if got.NextRefreshAfter.Before(entered.Add(metaADConfirmDelay-time.Second)) || got.NextRefreshAfter.After(entered.Add(metaADConfirmDelay+time.Second)) {
+		t.Fatalf("NextRefreshAfter = %v, want about %v after the episode began", got.NextRefreshAfter, metaADConfirmDelay)
+	}
+	if saves := store.markerSaves(); len(saves) != 0 {
+		t.Fatalf("saves with markers = %d, want 0", len(saves))
+	}
+}
+
+func TestMetaAutoDisableWrite_FailedSaveAfterLocalWriteKeepsCapSlot(t *testing.T) {
+	// A store that writes the watched local file first and uploads afterwards can fail the
+	// Save after the local copy already carries the disable. Refunding the slot would let
+	// the local disables exceed the cap.
+	store := &metaADWrStore{localThenFail: true}
+	exec := newMetaADTestExecutor()
+	m := newMetaADWrManager(t, metaADWrConfig(true, 1), store, exec, false,
+		metaADWrFileAuth("a1-first", "dead-a1", "dca:a1"), metaADWrFileAuth("b2-second", "dead-b2", "dca:b2"))
+	metaADWrCraftConfirmed(t, m, "a1-first", metaADReasonNewKeyRejected)
+	metaADWrCraftConfirmed(t, m, "b2-second", metaADReasonNewKeyRejected)
+
+	before := time.Now()
+	m.metaAutoDisableWrite("a1-first", metaADWrEpisode(t, m, "a1-first"))
+	after := time.Now()
+	a := metaADGet(t, m, "a1-first")
+	if a.Disabled {
+		t.Fatalf("the disable was published although the save failed")
+	}
+	if !a.metaAD.confirmed {
+		t.Fatalf("a1-first lost its confirmed verdict")
+	}
+	metaADRequireDueIn(t, a, before, after, metaADWriteRetryDelay)
+	if stamps := metaADWrLimiterStamps(m); stamps != 1 {
+		t.Fatalf("limiter stamps = %d, want 1: a failed save must keep its slot", stamps)
+	}
+
+	m.metaAutoDisableWrite("b2-second", metaADWrEpisode(t, m, "b2-second"))
+	b := metaADGet(t, m, "b2-second")
+	if state, _, _, ok := b.MetaAutoDisableStatus(); !ok || state != metaADStateCapped {
+		t.Fatalf("b2-second state = %q ok=%v, want capped by the kept slot", state, ok)
+	}
+	store.mu.Lock()
+	local := len(store.localFiles)
+	store.mu.Unlock()
+	if local != 1 {
+		t.Fatalf("credentials with a local disable = %d, want 1 (the cap)", local)
+	}
+}
+
+func TestMetaAutoDisableWrite_ForcedRefreshOfConfirmedCredentialWritesOnlyOnRejection(t *testing.T) {
+	cases := []struct {
+		name   string
+		result metaADRefreshResult
+		want   string // "keep", "written" or "rescued"
+	}{
+		{"network error", metaADRefreshResult{err: metaADNetworkErr()}, "keep"},
+		{"mint 503", metaADRefreshResult{err: metaADMintErr(http.StatusServiceUnavailable)}, "keep"},
+		{"mint 500", metaADRefreshResult{err: metaADMintErr(http.StatusInternalServerError)}, "keep"},
+		{"mint 401", metaADRefreshResult{err: metaADMintErr(http.StatusUnauthorized)}, "written"},
+		{"mint 403", metaADRefreshResult{err: metaADMintErr(http.StatusForbidden)}, "written"},
+		{"mint success", metaADRefreshResult{}, "rescued"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &metaADWrStore{}
+			exec := newMetaADTestExecutor("dead-key-0")
+			exec.enqueue(metaADRefreshResult{err: metaADMintErr(http.StatusUnauthorized)}, metaADRefreshResult{err: metaADMintErr(http.StatusUnauthorized)})
+			m := newMetaADWrManager(t, metaADWrConfig(true, 0), store, exec, true,
+				metaADWrFileAuth(metaADPrimaryID, "dead-key-0", "dca:primary"), metaADBackup())
+			if _, err := metaADExecute(m, metaADModelA); err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+			// The confirmation reaches its verdict but the first save fails: confirmed, unsaved.
+			store.failNext(1)
+			metaADConfirmDue(m, metaADPrimaryID)
+			unsaved := metaADGet(t, m, metaADPrimaryID)
+			if !unsaved.metaAD.confirmed || unsaved.Disabled {
+				t.Fatalf("precondition: confirmed=%v disabled=%v", unsaved.metaAD.confirmed, unsaved.Disabled)
+			}
+			stampsBefore := metaADWrLimiterStamps(m)
+			savesBefore := len(store.markerSaves())
+
+			exec.enqueue(tc.result)
+			_, _ = m.ForceRefreshAuth(context.Background(), metaADPrimaryID)
+
+			got := metaADGet(t, m, metaADPrimaryID)
+			switch tc.want {
+			case "keep":
+				metaADRequireTracked(t, got, metaADStatePending, metaADReasonMintRejected)
+				if !got.metaAD.confirmed || got.Disabled {
+					t.Fatalf("confirmed=%v disabled=%v, a transient failure must keep the verdict", got.metaAD.confirmed, got.Disabled)
+				}
+				if got.NextRefreshAfter.IsZero() || !got.NextRefreshAfter.Equal(unsaved.NextRefreshAfter) {
+					t.Fatalf("NextRefreshAfter %v -> %v, want non-zero and unchanged", unsaved.NextRefreshAfter, got.NextRefreshAfter)
+				}
+				if after := len(store.markerSaves()); after != savesBefore {
+					t.Fatalf("marker saves %d -> %d, want no write", savesBefore, after)
+				}
+				if stamps := metaADWrLimiterStamps(m); stamps != stampsBefore {
+					t.Fatalf("limiter stamps %d -> %d, want no new slot", stampsBefore, stamps)
+				}
+			case "written":
+				metaADWrRequireDisabledNoPriority(t, got, metaADReasonMintRejected)
+			case "rescued":
+				metaADRequireNotTracked(t, got)
+				if got.Disabled || got.Unavailable {
+					t.Fatalf("disabled=%v unavailable=%v, want a rescued credential", got.Disabled, got.Unavailable)
+				}
+				if blocked, _, _ := isAuthBlockedForModel(got, metaADModelA, time.Now()); blocked {
+					t.Fatalf("rescued credential still blocked")
+				}
+				if after := len(store.markerSaves()); after != savesBefore {
+					t.Fatalf("marker saves %d -> %d, want nothing written", savesBefore, after)
+				}
+			}
 		})
 	}
 }

@@ -200,6 +200,10 @@ routing:
   # meta-auto-disable:
   #   enabled: false
   #   max-per-hour: 20 # cap on automatic disables per rolling hour (default 20); credentials over the cap stay blocked and are confirmed again every 10 minutes
+  # With a remote auth store (object store, Postgres, git) the disable is written to the watched local file
+  # first and uploaded afterwards. If the upload fails the local disable stands and still counts toward the
+  # cap, but the next sync from the remote can bring the credential back as enabled; the next 401 then starts
+  # the detection again.
 
   # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
   force-model-prefix: false

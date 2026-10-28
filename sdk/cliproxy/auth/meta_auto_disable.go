@@ -105,6 +105,25 @@ type metaAutoDisableState struct {
 	replacedAt  time.Time
 }
 
+// metaADEpisode identifies one pending/confirmed episode of one credential. Evidence and
+// writes carry the episode their caller saw, and only act when the live episode is the
+// same one: after a re-login a fresh episode must not inherit an older episode's verdict.
+type metaADEpisode struct {
+	cred   string
+	epoch  uint64
+	since  time.Time
+	reason string
+}
+
+func (s metaAutoDisableState) episode() metaADEpisode {
+	return metaADEpisode{cred: s.cred, epoch: s.epoch, since: s.since, reason: s.reason}
+}
+
+// is reports whether s is the episode e (and a tracked one).
+func (s metaAutoDisableState) is(e metaADEpisode) bool {
+	return s.state != "" && s.cred == e.cred && s.epoch == e.epoch && s.since.Equal(e.since) && s.reason == e.reason
+}
+
 func (s metaAutoDisableState) tracked(auth *Auth) bool {
 	return s.state != "" && s.cred == metaADFingerprint(auth)
 }
@@ -330,6 +349,27 @@ func metaADEnterCapped(auth *Auth, now time.Time) {
 	metaADApplyBlocked(auth, now.Add(metaADCapRetryDelay), auth.metaAD.reason)
 }
 
+// metaADCancelTracking ends the tracking and lifts the block that the feature itself put on
+// the credential (the synthetic 401, Unavailable, StatusError), so it falls back to the normal
+// handling. Model states and cooldowns of other causes are left alone. It is used when the
+// switch was turned off while a write was pending.
+func metaADCancelTracking(auth *Auth, now time.Time) {
+	auth.metaAD.clearPending()
+	if metaADRejectionError(auth.LastError) {
+		if !(auth.Quota.Exceeded && auth.Quota.NextRecoverAt.After(now)) {
+			auth.Unavailable = false
+		}
+		if auth.Status == StatusError {
+			auth.Status = StatusActive
+		}
+		auth.NextRetryAfter = time.Time{}
+		auth.StatusMessage = ""
+		auth.LastError = nil
+	}
+	auth.NextRefreshAfter = time.Time{}
+	auth.RefreshFailures = 0
+}
+
 // metaADRejectionError reports whether err is the 401/403 a rejected mint or key leaves behind.
 func metaADRejectionError(err *Error) bool {
 	if err == nil {
@@ -548,7 +588,7 @@ func (m *Manager) metaAutoDisablePreRefresh(auth *Auth, force bool, failedToken 
 		return true, errMetaAutoDisableAwaiting
 	}
 	if auth.metaAD.confirmed || auth.metaAD.reason != metaADReasonMintRejected {
-		m.metaAutoDisableSettle(auth.ID)
+		m.metaAutoDisableSettle(auth.ID, auth.metaAD.episode())
 		return true, errMetaAutoDisableConfirmed
 	}
 	if metaADDCAToken(auth) == "" {
@@ -576,6 +616,7 @@ func (m *Manager) metaAutoDisableOnRefreshError(id string, base *Auth, err error
 		return false
 	}
 	handled, needWrite := false, false
+	var episode metaADEpisode
 	m.metaADMutate(id, func(live *Auth) bool {
 		// Cases the generic code already resolves on its own.
 		if !metaADEligible(live) || base.RegistrationEpoch != live.RegistrationEpoch || (hasUnauthorizedAuthFailure(live) && !force) {
@@ -596,17 +637,28 @@ func (m *Manager) metaAutoDisableOnRefreshError(id string, base *Auth, err error
 		}
 		rejected := metaADMintRejected(err)
 		tracked := live.metaAD.tracked(live)
+		// The failure is evidence for the episode the refresh started with. An episode that
+		// began while the mint was in flight (or a different one) is not confirmed by it.
+		if tracked && !(base.metaAD.state != "" && base.metaAD.is(live.metaAD.episode())) {
+			handled = true
+			return false
+		}
 		switch {
 		case tracked && live.metaAD.confirmed:
-			// Only an operator-forced refresh gets here (the loop writes without a mint). The
-			// mint was rejected again, so complete the disable write that could not be saved.
+			// Only an operator-forced refresh gets here (the loop writes without a mint). A
+			// rejected mint completes the disable write that could not be saved; a transient
+			// failure proves nothing, so the credential keeps its verdict and its retry time.
 			handled = true
-			needWrite = true
+			if rejected {
+				needWrite = true
+				episode = live.metaAD.episode()
+			}
 			return false
 		case tracked && rejected:
 			handled = true
 			metaADMarkConfirmed(live, now)
 			needWrite = true
+			episode = live.metaAD.episode()
 			return true
 		case tracked:
 			handled = true
@@ -623,23 +675,29 @@ func (m *Manager) metaAutoDisableOnRefreshError(id string, base *Auth, err error
 	})
 	if needWrite {
 		// The gate is released here: Modify takes it itself.
-		m.metaAutoDisableWrite(id)
+		m.metaAutoDisableWrite(id, episode)
 	}
 	return handled
 }
 
 // metaAutoDisableOnRefreshSaveError runs when a successful mint could not be saved.
-// The credential keeps its old key, so a tracked one must not be left with the
-// refresh job's pending marker cleared to zero (which would read as a terminal
-// unauthorized failure): it goes back to retry with a real confirmation time.
+// The credential keeps its old key, so a tracked one must not be left with the refresh
+// job's pending marker cleared to zero (which would read as a terminal unauthorized
+// failure): it goes back to retry with a real confirmation time. A confirmed credential
+// (an operator-forced refresh minted for it) loses its dead verdict: the mint just worked,
+// so the next confirmation mints again (reason mint_rejected) instead of writing a disable
+// for a credential that was rescued.
 func (m *Manager) metaAutoDisableOnRefreshSaveError(id string, before *Auth) {
 	if !metaADEligible(before) || !before.metaAD.tracked(before) {
 		return
 	}
 	now := time.Now()
 	m.metaADMutate(id, func(live *Auth) bool {
-		if !live.metaAD.tracked(live) || live.metaAD.confirmed || !live.metaAD.since.Equal(before.metaAD.since) {
+		if !live.metaAD.tracked(live) || !live.metaAD.since.Equal(before.metaAD.since) {
 			return false
+		}
+		if live.metaAD.confirmed && metaADDCAToken(live) != "" {
+			live.metaAD.reason = metaADReasonMintRejected
 		}
 		metaADEnterRetry(live, now)
 		return true
@@ -819,37 +877,65 @@ func metaADPersistRequired(ctx context.Context) bool {
 
 // metaAutoDisableSettle turns a dead verdict into a written disable: it marks the tracked
 // credential confirmed (under the mutation gate), then writes. It is used when the verdict
-// needs no mint, or is already reached and the write is being retried.
-func (m *Manager) metaAutoDisableSettle(id string) {
-	now := time.Now()
-	m.metaADMutate(id, func(live *Auth) bool {
-		if !metaADEligible(live) || !live.metaAD.tracked(live) || live.metaAD.confirmed {
-			return false
-		}
-		metaADMarkConfirmed(live, now)
-		return true
-	})
-	m.metaAutoDisableWrite(id)
+// needs no mint, or is already reached and the write is being retried. episode is the
+// episode the caller saw: if the live credential is in another one (it was re-logged-in and
+// went pending again meanwhile), nothing happens to it.
+func (m *Manager) metaAutoDisableSettle(id string, episode metaADEpisode) {
+	live, ok := m.GetByID(id)
+	if !ok || !metaADEligible(live) || !live.metaAD.tracked(live) || !live.metaAD.is(episode) {
+		return
+	}
+	if !live.metaAD.confirmed {
+		now := time.Now()
+		m.metaADMutate(id, func(cur *Auth) bool {
+			if !metaADEligible(cur) || !cur.metaAD.tracked(cur) || !cur.metaAD.is(episode) || cur.metaAD.confirmed {
+				return false
+			}
+			metaADMarkConfirmed(cur, now)
+			return true
+		})
+	}
+	m.metaAutoDisableWrite(id, episode)
 }
 
 // metaAutoDisableWrite persists the disable of a confirmed credential. It must be called
 // without the mutation gate or m.mu: Manager.Modify takes the gate itself. The decision was
 // made under the gate earlier, so every guard is checked again inside the edit, which runs
 // under the gate on the freshest live copy; a credential that was replaced, disabled by
-// someone else or re-registered in between is left untouched. The hourly cap is reserved
-// before the write and given back when nothing was written.
-func (m *Manager) metaAutoDisableWrite(id string) {
+// someone else or re-registered in between is left untouched, and so is a different
+// episode than the caller's. The hourly cap is reserved before the write and given back
+// when nothing was written.
+//
+// A failed Store.Save keeps the slot: a store that writes the watched local file first and
+// uploads afterwards (object store, Postgres, git) may have landed the disable locally
+// already, and refunding would let the local disables exceed the cap. Only a write that
+// was skipped, or rejected for a stale registration, gives the slot back. With such a
+// store a failed upload leaves the remote copy enabled: the local disable stands until
+// the next sync from the remote restores the credential, and a later 401 starts the
+// detection again.
+func (m *Manager) metaAutoDisableWrite(id string, episode metaADEpisode) {
 	live, ok := m.GetByID(id)
-	if !ok || !m.metaAutoDisableEnabled() || !metaADEligible(live) || !live.metaAD.tracked(live) || !live.metaAD.confirmed {
+	if !ok || !metaADEligible(live) || !live.metaAD.tracked(live) || !live.metaAD.confirmed || !live.metaAD.is(episode) {
+		return
+	}
+	now := time.Now()
+	if !m.metaAutoDisableEnabled() {
+		// The switch was turned off meanwhile: this credential is not auto-disabled any more.
+		m.metaADMutate(id, func(cur *Auth) bool {
+			if !cur.metaAD.tracked(cur) || !cur.metaAD.is(episode) {
+				return false
+			}
+			metaADCancelTracking(cur, now)
+			return true
+		})
 		return
 	}
 	state := live.metaAD
-	now := time.Now()
 	limit := m.runtimeConfigSnapshot().Routing.MetaAutoDisable.EffectiveMaxPerHour()
 	reserved, logCap := m.metaADLimiter.reserve(now, limit)
 	if !reserved {
 		m.metaADMutate(id, func(cur *Auth) bool {
-			if !cur.metaAD.tracked(cur) || !cur.metaAD.confirmed || !cur.metaAD.since.Equal(state.since) {
+			if !cur.metaAD.tracked(cur) || !cur.metaAD.confirmed || !cur.metaAD.is(episode) {
 				return false
 			}
 			metaADEnterCapped(cur, now)
@@ -872,9 +958,12 @@ func (m *Manager) metaAutoDisableWrite(id string) {
 		m.metaADLimiter.release(now)
 		m.metaADAfterSkippedWrite(id, state, now)
 	default:
-		// A failed save (or a registration that changed meanwhile). Nothing was published.
-		m.metaADLimiter.release(now)
-		m.metaADRetryWriteLater(id, state, now, err)
+		// A failed save, or a registration that changed meanwhile (Modify rejected the stale
+		// epoch, or the credential is gone): in the latter nothing could have been written.
+		if cur, present := m.GetByID(id); !present || cur.RegistrationEpoch != state.epoch {
+			m.metaADLimiter.release(now)
+		}
+		m.metaADRetryWriteLater(id, state, time.Now(), err)
 	}
 }
 
@@ -910,9 +999,13 @@ func (m *Manager) metaADApplyDisable(a *Auth, state metaAutoDisableState, now ti
 }
 
 // metaADAfterSkippedWrite cleans up after a write that a guard skipped. A credential that
-// someone else disabled is no longer tracked. One that is still tracked keeps a future
-// retry time, so the refresh job that triggered the write cannot leave it with none.
+// someone else disabled is no longer tracked. If the switch was turned off, the credential
+// is released from the feature (tracking and its own block). One that is still tracked gets
+// a new retry time of its own: the refresh job that triggered the write holds its
+// pendingUntil marker in NextRefreshAfter and zeroes it when it finishes, so that value
+// must never be mistaken for a deadline.
 func (m *Manager) metaADAfterSkippedWrite(id string, state metaAutoDisableState, now time.Time) {
+	episode := state.episode()
 	m.metaADMutate(id, func(cur *Auth) bool {
 		if cur.Disabled || cur.Status == StatusDisabled {
 			if cur.metaAD.state == "" {
@@ -921,10 +1014,22 @@ func (m *Manager) metaADAfterSkippedWrite(id string, state metaAutoDisableState,
 			cur.metaAD.clearPending()
 			return true
 		}
-		if !cur.metaAD.tracked(cur) || !cur.metaAD.since.Equal(state.since) || cur.NextRefreshAfter.After(now) {
+		if !cur.metaAD.tracked(cur) || !cur.metaAD.is(episode) {
 			return false
 		}
-		metaADApplyBlocked(cur, now.Add(metaADWriteRetryDelay), cur.metaAD.reason)
+		if !m.metaAutoDisableEnabled() {
+			metaADCancelTracking(cur, now)
+			return true
+		}
+		if !cur.metaAD.confirmed {
+			// Another flow moved the credential on (retry, capped) and set its own deadline.
+			return false
+		}
+		due := now.Add(metaADWriteRetryDelay)
+		if due.Equal(cur.NextRefreshAfter) {
+			due = due.Add(time.Nanosecond)
+		}
+		metaADApplyBlocked(cur, due, cur.metaAD.reason)
 		return true
 	})
 }
