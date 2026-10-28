@@ -180,6 +180,8 @@ type Manager struct {
 	selectorMu                sync.Mutex
 	configCooldownMu          sync.Mutex
 	syncSchedulerMu           sync.Mutex
+	// metaADLimiter bounds how many Meta credentials may be auto-disabled per hour (in memory).
+	metaADLimiter metaADLimiter
 	// executionSeq stamps upstream dispatches with a monotonic sequence used
 	// to reject cooldown clears from executions dispatched before the cooldown.
 	executionSeq       atomic.Uint64

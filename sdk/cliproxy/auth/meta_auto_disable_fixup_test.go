@@ -180,6 +180,7 @@ type metaADFxStore struct {
 	fail    bool
 	saving  chan struct{}
 	release chan struct{}
+	saved   []*Auth
 }
 
 func newMetaADFxStore() *metaADFxStore {
@@ -192,6 +193,17 @@ func (s *metaADFxStore) setFail(v bool) {
 	s.mu.Unlock()
 }
 
+// lastSaved returns a copy of the auth passed to the most recent successful Save.
+func (s *metaADFxStore) lastSaved() *Auth {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.saved) == 0 {
+		return nil
+	}
+	return s.saved[len(s.saved)-1].Clone()
+}
+
+// armBlock makes the next Save block; later Saves are not blocked.
 func (s *metaADFxStore) armBlock() {
 	s.mu.Lock()
 	s.block = true
@@ -203,8 +215,11 @@ func (s *metaADFxStore) Delete(context.Context, string) error  { return nil }
 
 // Save ignores ctx on purpose: a competing mutation cancels the persist context, and the
 // test needs the save to stay in flight until it is released.
-func (s *metaADFxStore) Save(context.Context, *Auth) (string, error) {
+func (s *metaADFxStore) Save(_ context.Context, auth *Auth) (string, error) {
 	s.mu.Lock()
+	if !s.fail {
+		s.saved = append(s.saved, auth.Clone())
+	}
 	fail, block := s.fail, s.block
 	s.block = false
 	s.mu.Unlock()
@@ -844,13 +859,12 @@ func TestMetaAutoDisableFixup_RefreshErrorTransitionSurvivesConcurrentSave(t *te
 		{
 			name:   "confirmation_401_confirms",
 			status: http.StatusUnauthorized,
-			check: func(t *testing.T, got *Auth, raw metaAutoDisableState, before, _ time.Time) {
-				if !raw.confirmed {
-					t.Fatalf("confirmed = false, want the 401 confirmation to survive the concurrent save")
+			check: func(t *testing.T, got *Auth, raw metaAutoDisableState, _, _ time.Time) {
+				// The confirmation wrote the disable: tracking is gone, the markers are set.
+				if raw.state != "" || raw.confirmed {
+					t.Fatalf("raw state = %+v, want the tracking cleared by the written disable", raw)
 				}
-				if got.NextRefreshAfter.Before(before.Add(23 * time.Hour)) {
-					t.Fatalf("NextRefreshAfter = %v, want >= now+23h", got.NextRefreshAfter)
-				}
+				metaADFxRequireDisabledMarkers(t, got, metaADReasonMintRejected)
 			},
 		},
 		{
@@ -917,9 +931,18 @@ func TestMetaAutoDisableFixup_RefreshErrorTransitionSurvivesConcurrentSave(t *te
 				t.Fatalf("Refresh calls = %d, want 2 (request mint + confirmation)", got)
 			}
 			got := metaADFxGet(t, m, metaADFxPrimaryID)
-			metaADFxRequireTracked(t, got, map[bool]string{true: metaADStatePending, false: metaADStateRetry}[tc.status == http.StatusUnauthorized], metaADReasonMintRejected)
+			if tc.status == http.StatusInternalServerError {
+				metaADFxRequireTracked(t, got, metaADStateRetry, metaADReasonMintRejected)
+			}
 			if got.Attributes["label"] != "unrelated change" {
 				t.Fatalf("the concurrent save was lost: attributes = %v", got.Attributes)
+			}
+			if tc.status == http.StatusUnauthorized {
+				// The disable was saved on top of the concurrent change.
+				last := store.lastSaved()
+				if last == nil || !last.Disabled || last.Attributes["label"] != "unrelated change" {
+					t.Fatalf("last Save = %+v, want the disabled credential carrying the unrelated change", last)
+				}
 			}
 			tc.check(t, got, metaADFxRaw(m, metaADFxPrimaryID), before, after)
 		})
@@ -1299,5 +1322,143 @@ func TestMetaAutoDisableFixup2_SwitchOffRefreshErrorDoesNotTakeMutationGate(t *t
 		}
 		finish()
 		metaADFxRequireTracked(t, metaADFxGet(t, m, metaADFxPrimaryID), metaADStatePending, metaADReasonMintRejected)
+	})
+}
+
+// metaADFxRequireDisabledMarkers checks a credential whose auto-disable was written.
+func metaADFxRequireDisabledMarkers(t *testing.T, a *Auth, reason string) {
+	t.Helper()
+	if !a.Disabled || a.Status != StatusDisabled {
+		t.Fatalf("Disabled=%v Status=%v, want disabled", a.Disabled, a.Status)
+	}
+	if want := fmt.Sprintf("disabled (meta %s)", reason); a.StatusMessage != want {
+		t.Fatalf("StatusMessage = %q, want %q", a.StatusMessage, want)
+	}
+	if a.Metadata["disabled"] != true || a.Metadata["disabled_by"] != "cliproxyapi" || a.Metadata["disabled_reason"] != reason {
+		t.Fatalf("metadata markers = %v", a.Metadata)
+	}
+	at, _ := a.Metadata["disabled_at"].(string)
+	if _, err := time.Parse(time.RFC3339, at); err != nil {
+		t.Fatalf("disabled_at = %q: %v", at, err)
+	}
+	metaADFxRequireNotTracked(t, a)
+}
+
+// A confirmed verdict whose disable could not be saved is not published and not minted for
+// again; the background refresh retries the write once the store works.
+func TestMetaAutoDisableFixup3_FailedDisableSaveIsRetriedByBackgroundRefresh(t *testing.T) {
+	store := newMetaADFxStore()
+	m, exec := metaADFxEnterPendingViaRequest(t, store, http.StatusUnauthorized)
+	exec.enqueue(metaADFxMintErr(http.StatusUnauthorized))
+
+	store.setFail(true)
+	metaADFxMakeDue(m, metaADFxPrimaryID)
+	before := time.Now()
+	m.refreshAuth(context.Background(), metaADFxPrimaryID)
+	after := time.Now()
+
+	got := metaADFxGet(t, m, metaADFxPrimaryID)
+	if got.Disabled || got.Status == StatusDisabled {
+		t.Fatalf("a disable that could not be saved was published")
+	}
+	metaADFxRequireTracked(t, got, metaADStatePending, metaADReasonMintRejected)
+	if raw := metaADFxRaw(m, metaADFxPrimaryID); !raw.confirmed {
+		t.Fatalf("confirmed = false, want the verdict kept for the retry")
+	}
+	if got.NextRefreshAfter.Before(before.Add(metaADWriteRetryDelay-time.Second)) || got.NextRefreshAfter.After(after.Add(metaADWriteRetryDelay+time.Second)) {
+		t.Fatalf("NextRefreshAfter = %v, want about now+%v", got.NextRefreshAfter, metaADWriteRetryDelay)
+	}
+
+	// The store recovers: the retry writes the disable and does not mint again.
+	store.setFail(false)
+	mints := exec.refreshCount()
+	metaADFxMakeDue(m, metaADFxPrimaryID)
+	m.refreshAuth(context.Background(), metaADFxPrimaryID)
+
+	if exec.refreshCount() != mints {
+		t.Fatalf("Refresh calls went from %d to %d: a confirmed credential must not be minted for", mints, exec.refreshCount())
+	}
+	metaADFxRequireDisabledMarkers(t, metaADFxGet(t, m, metaADFxPrimaryID), metaADReasonMintRejected)
+	if last := store.lastSaved(); last == nil || !last.Disabled || last.Metadata["disabled_by"] != "cliproxyapi" {
+		t.Fatalf("last Save = %+v, want the disabled credential", last)
+	}
+}
+
+func (m *Manager) metaADFxLimiterSlots() int {
+	m.metaADLimiter.mu.Lock()
+	defer m.metaADLimiter.mu.Unlock()
+	return len(m.metaADLimiter.stamps)
+}
+
+// metaADFxConfirmedUnsaved returns a manager whose primary is confirmed dead but whose
+// disable could not be saved.
+func metaADFxConfirmedUnsaved(t *testing.T) (*Manager, *metaADFxExecutor, *metaADFxStore) {
+	t.Helper()
+	store := newMetaADFxStore()
+	m, exec := metaADFxEnterPendingViaRequest(t, store, http.StatusUnauthorized)
+	exec.enqueue(metaADFxMintErr(http.StatusUnauthorized))
+	store.setFail(true)
+	metaADFxMakeDue(m, metaADFxPrimaryID)
+	m.refreshAuth(context.Background(), metaADFxPrimaryID)
+	if raw := metaADFxRaw(m, metaADFxPrimaryID); !raw.confirmed {
+		t.Fatalf("precondition: credential is not confirmed")
+	}
+	if got := metaADFxGet(t, m, metaADFxPrimaryID); got.Disabled {
+		t.Fatalf("precondition: the failed save was published")
+	}
+	if n := m.metaADFxLimiterSlots(); n != 0 {
+		t.Fatalf("precondition: limiter holds %d slots after a failed save, want 0", n)
+	}
+	store.setFail(false)
+	return m, exec, store
+}
+
+// An operator-forced refresh of a confirmed credential whose disable was not saved.
+func TestMetaAutoDisableFixup3_ForcedRefreshCompletesPendingWrite(t *testing.T) {
+	t.Run("mint_rejected_again_writes", func(t *testing.T) {
+		m, exec, store := metaADFxConfirmedUnsaved(t)
+		exec.enqueue(metaADFxMintErr(http.StatusForbidden))
+
+		if _, err := m.ForceRefreshAuth(context.Background(), metaADFxPrimaryID); err == nil {
+			t.Fatalf("ForceRefreshAuth error = nil, want the rejected mint")
+		}
+
+		metaADFxRequireDisabledMarkers(t, metaADFxGet(t, m, metaADFxPrimaryID), metaADReasonMintRejected)
+		if last := store.lastSaved(); last == nil || !last.Disabled || last.Metadata["disabled_by"] != "cliproxyapi" {
+			t.Fatalf("last Save = %+v, want the disabled credential", last)
+		}
+		if n := m.metaADFxLimiterSlots(); n != 1 {
+			t.Fatalf("limiter slots = %d, want exactly 1 for the one written disable", n)
+		}
+	})
+
+	t.Run("mint_succeeds_rescues", func(t *testing.T) {
+		m, exec, store := metaADFxConfirmedUnsaved(t)
+		saves := len(store.saved)
+
+		if _, err := m.ForceRefreshAuth(context.Background(), metaADFxPrimaryID); err != nil {
+			t.Fatalf("ForceRefreshAuth: %v", err)
+		}
+
+		got := metaADFxGet(t, m, metaADFxPrimaryID)
+		metaADFxRequireNotTracked(t, got)
+		if got.Disabled || got.Status == StatusDisabled {
+			t.Fatalf("a rescued credential was disabled")
+		}
+		metaADFxRequireSelectable(t, got, metaADFxModels...)
+		if key := metaADKey(got); key != "fx-minted-1" {
+			t.Fatalf("key = %q, want the key minted by the forced refresh", key)
+		}
+		store.mu.Lock()
+		for _, saved := range store.saved[saves:] {
+			if saved.Disabled || saved.Metadata["disabled_by"] != nil {
+				t.Errorf("a disable was written: %+v", saved.Metadata)
+			}
+		}
+		store.mu.Unlock()
+		if n := m.metaADFxLimiterSlots(); n != 0 {
+			t.Fatalf("limiter slots = %d, want 0 (nothing was disabled)", n)
+		}
+		_ = exec
 	})
 }

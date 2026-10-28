@@ -195,9 +195,11 @@ routing:
 
   # Automatically stop using Meta credentials (from auth files, not meta-api-key entries) whose
   # API key was rejected and can no longer be minted from the dca_token. Off by default; hot-reloaded.
+  # A dead credential is blocked, confirmed again after a short delay, then disabled in its auth file
+  # (disabled: true, disabled_by: cliproxyapi, disabled_reason, disabled_at).
   # meta-auto-disable:
   #   enabled: false
-  #   max-per-hour: 20 # cap on automatic disables per rolling hour (default 20)
+  #   max-per-hour: 20 # cap on automatic disables per rolling hour (default 20); credentials over the cap stay blocked and are confirmed again every 10 minutes
 
   # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
   force-model-prefix: false

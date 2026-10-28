@@ -491,45 +491,32 @@ func TestMetaAutoDisable_ConfirmationMintSuccessRestores(t *testing.T) {
 	}
 }
 
-func TestMetaAutoDisable_ConfirmationMintRejectedParksConfirmed(t *testing.T) {
+func TestMetaAutoDisable_ConfirmationMintRejectedWritesDisable(t *testing.T) {
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
 		t.Run(fmt.Sprintf("mint_%d", status), func(t *testing.T) {
 			m, exec := metaADEnterPendingViaRequest(t, http.StatusUnauthorized)
 			exec.enqueue(metaADRefreshResult{err: metaADMintErr(status)})
 
-			before := time.Now()
 			metaADConfirmDue(m, metaADPrimaryID)
-			after := time.Now()
 
 			if got := exec.RefreshCalls(); got != 2 {
 				t.Fatalf("Refresh calls = %d, want 2", got)
 			}
 			got := metaADGet(t, m, metaADPrimaryID)
-			metaADRequireTracked(t, got, metaADStatePending, metaADReasonMintRejected)
-			if !got.metaAD.confirmed {
-				t.Fatalf("metaAD.confirmed = false, want true")
-			}
-			metaADRequireBlockedShape(t, got, metaADReasonMintRejected)
-			metaADRequireBlockedEverywhere(t, got)
-			if got.NextRefreshAfter.Before(before.Add(23 * time.Hour)) {
-				t.Fatalf("NextRefreshAfter = %v, want >= now+23h", got.NextRefreshAfter)
-			}
-			metaADRequireDueIn(t, got, before, after, metaADConfirmedHold)
-			if !got.NextRetryAfter.IsZero() {
-				t.Fatalf("NextRetryAfter = %v, want zero", got.NextRetryAfter)
-			}
+			metaADWrRequireDisabledNoPriority(t, got, metaADReasonMintRejected)
 
-			// A confirmed credential is never minted again, even when due.
-			metaADConfirmDue(m, metaADPrimaryID)
-			if calls := exec.RefreshCalls(); calls != 2 {
-				t.Fatalf("Refresh calls after second due = %d, want 2 (confirmed is parked)", calls)
-			}
+			// A disabled credential is not minted for again: it is not due and not scheduled.
 			metaADMakeDue(m, metaADPrimaryID)
 			due := metaADGet(t, m, metaADPrimaryID)
 			if m.shouldRefresh(due, time.Now()) {
-				t.Fatalf("shouldRefresh = true for a confirmed credential")
+				t.Fatalf("shouldRefresh = true for a disabled credential")
 			}
-			metaADRequireTracked(t, due, metaADStatePending, metaADReasonMintRejected)
+			if next, schedule := nextRefreshCheckAt(time.Now(), due, time.Second); schedule || !next.IsZero() {
+				t.Fatalf("nextRefreshCheckAt = (%v, %v), want (zero, false)", next, schedule)
+			}
+			if got := exec.RefreshCalls(); got != 2 {
+				t.Fatalf("Refresh calls = %d, want 2 (no mint after the disable)", got)
+			}
 		})
 	}
 }
@@ -597,13 +584,8 @@ func TestMetaAutoDisable_NoDCATokenNeverMints(t *testing.T) {
 	if got := exec.RefreshCalls(); got != 0 {
 		t.Fatalf("Refresh calls after confirmation = %d, want 0", got)
 	}
-	got = metaADGet(t, m, metaADPrimaryID)
-	metaADRequireTracked(t, got, metaADStatePending, metaADReasonNoDCAToken)
-	if !got.metaAD.confirmed {
-		t.Fatalf("metaAD.confirmed = false, want true (no_dca_token goes straight to confirmed)")
-	}
-	metaADRequireBlockedShape(t, got, metaADReasonNoDCAToken)
-	metaADRequireBlockedEverywhere(t, got)
+	// no_dca_token goes straight to the written disable, never to a mint.
+	metaADWrRequireDisabledNoPriority(t, metaADGet(t, m, metaADPrimaryID), metaADReasonNoDCAToken)
 }
 
 // metaADExecuteStream runs one streaming request and drains the returned stream.
@@ -686,17 +668,12 @@ func TestMetaAutoDisable_NewKeyRejectedEntersPendingInSameRequest(t *testing.T) 
 				t.Fatalf("shouldRefresh = false once the confirmation is due")
 			}
 
-			// Confirmation never mints for new_key_rejected and ends confirmed.
+			// Confirmation never mints for new_key_rejected and writes the disable.
 			metaADConfirmDue(m, metaADPrimaryID)
 			if got := exec.RefreshCalls(); got != 1 {
 				t.Fatalf("Refresh calls after confirmation = %d, want 1", got)
 			}
-			got = metaADGet(t, m, metaADPrimaryID)
-			metaADRequireTracked(t, got, metaADStatePending, metaADReasonNewKeyRejected)
-			if !got.metaAD.confirmed {
-				t.Fatalf("metaAD.confirmed = false, want true")
-			}
-			metaADRequireBlockedShape(t, got, metaADReasonNewKeyRejected)
+			metaADWrRequireDisabledNoPriority(t, metaADGet(t, m, metaADPrimaryID), metaADReasonNewKeyRejected)
 		})
 	}
 }
@@ -1214,29 +1191,58 @@ func TestMetaAutoDisable_RefreshScheduleHookKeepsDueConfirmation(t *testing.T) {
 	metaADRequireNotTracked(t, metaADGet(t, m, metaADPrimaryID))
 }
 
-func TestMetaAutoDisable_ConfirmedAuthLeavesRefreshLoop(t *testing.T) {
-	m, exec := metaADEnterPendingViaRequest(t, http.StatusUnauthorized)
-	exec.enqueue(metaADRefreshResult{err: metaADMintErr(http.StatusUnauthorized)})
-	metaADConfirmDue(m, metaADPrimaryID)
+func TestMetaAutoDisable_ConfirmedAuthStaysInRefreshLoopUntilWritten(t *testing.T) {
+	store := &metaADWrStore{}
+	exec := newMetaADTestExecutor("dead-key-0")
+	exec.enqueue(metaADRefreshResult{err: metaADMintErr(http.StatusUnauthorized)}, metaADRefreshResult{err: metaADMintErr(http.StatusUnauthorized)})
+	m := newMetaADWrManager(t, metaADWrConfig(true, 0), store, exec, true,
+		metaADWrFileAuth(metaADPrimaryID, "dead-key-0", "dca:primary"), metaADBackup())
+	if _, err := metaADExecute(m, metaADModelA); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
 
-	// Once the parked hold has passed, a confirmed auth is neither scheduled nor refreshed.
+	// (a) The save fails: the confirmed credential stays tracked and keeps being retried.
+	store.failNext(1)
+	metaADConfirmDue(m, metaADPrimaryID)
 	metaADMakeDue(m, metaADPrimaryID)
 	parked := metaADGet(t, m, metaADPrimaryID)
-	if !parked.metaAD.confirmed {
-		t.Fatalf("precondition: auth is not confirmed")
+	if !parked.metaAD.confirmed || parked.Disabled {
+		t.Fatalf("precondition: confirmed=%v disabled=%v, want a confirmed credential whose write failed", parked.metaAD.confirmed, parked.Disabled)
 	}
 	now := time.Now()
-	if next, schedule := nextRefreshCheckAt(now, parked, time.Second); schedule || !next.IsZero() {
-		t.Fatalf("nextRefreshCheckAt = (%v, %v), want (zero, false)", next, schedule)
+	if next, schedule := nextRefreshCheckAt(now, parked, time.Second); !schedule || next.After(now) {
+		t.Fatalf("nextRefreshCheckAt = (%v, %v), want (<= now, true)", next, schedule)
 	}
-	if m.shouldRefresh(parked, now) {
-		t.Fatalf("shouldRefresh = true for a confirmed auth")
+	if !m.shouldRefresh(parked, now) {
+		t.Fatalf("shouldRefresh = false for a confirmed credential whose write is pending")
 	}
+
+	// (b) Once the disable is written the credential leaves the loop.
+	ctx := context.Background()
 	l := newAuthAutoRefreshLoop(m, time.Second, 1)
-	l.handleDueAuth(context.Background(), now, metaADPrimaryID)
+	l.handleDueAuth(ctx, now, metaADPrimaryID)
 	select {
 	case job := <-l.jobs:
-		t.Fatalf("unexpected refresh job for a confirmed auth: %+v", job)
+		if m.beginRefreshJob(ctx, job) {
+			_, _ = m.refreshAuthForRequestAtEpoch(ctx, job.id, "", job.registrationEpoch)
+		}
+		m.finishRefreshJob(job, time.Time{}, false)
+	default:
+		t.Fatalf("no refresh job enqueued for the pending write")
+	}
+	written := metaADGet(t, m, metaADPrimaryID)
+	metaADWrRequireDisabledNoPriority(t, written, metaADReasonMintRejected)
+	now = time.Now()
+	if next, schedule := nextRefreshCheckAt(now, written, time.Second); schedule || !next.IsZero() {
+		t.Fatalf("nextRefreshCheckAt = (%v, %v), want (zero, false)", next, schedule)
+	}
+	if m.shouldRefresh(written, now) {
+		t.Fatalf("shouldRefresh = true for a disabled credential")
+	}
+	l.handleDueAuth(ctx, now, metaADPrimaryID)
+	select {
+	case job := <-l.jobs:
+		t.Fatalf("unexpected refresh job for a disabled credential: %+v", job)
 	default:
 	}
 }
