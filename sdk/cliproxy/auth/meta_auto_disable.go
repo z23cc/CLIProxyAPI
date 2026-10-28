@@ -299,12 +299,17 @@ func metaADRejectionError(err *Error) bool {
 }
 
 // metaADClearRejectionLeftovers clears the unavailability that a rejection (a mint or
-// key refused with 401/403) left on the auth and on its model states. The generic
-// recovery only recognises 401 and invalid_grant, so a 403 would otherwise keep the
-// credential cooling for 30 minutes after a confirmed mint. Cooldowns that come from
-// other causes (quota, transient errors) are left alone.
-func metaADClearRejectionLeftovers(auth *Auth, now time.Time) {
-	if metaADRejectionError(auth.LastError) {
+// key refused with 401/403) left on the auth and on its model states, and reports
+// whether it changed anything the cooldown store tracks. The generic recovery only
+// recognises 401 and invalid_grant, so a 403 would otherwise keep the credential
+// cooling for 30 minutes after a confirmed mint. Cooldowns that come from other
+// causes (quota, transient errors, at auth level or on a model) are left alone: the
+// auth-level state is only touched when its LastError is the 401/403, and the
+// aggregate availability is only recomputed when a model state was actually reset.
+func metaADClearRejectionLeftovers(auth *Auth, now time.Time) bool {
+	changed := false
+	authLevel := metaADRejectionError(auth.LastError)
+	if authLevel {
 		if !(auth.Quota.Exceeded && auth.Quota.NextRecoverAt.After(now)) {
 			auth.Unavailable = false
 		}
@@ -314,9 +319,15 @@ func metaADClearRejectionLeftovers(auth *Auth, now time.Time) {
 		auth.NextRetryAfter = time.Time{}
 		auth.StatusMessage = ""
 		auth.LastError = nil
+		changed = true
 	}
 	auth.NextRefreshAfter = time.Time{}
 	auth.RefreshFailures = 0
+
+	// An auth-level cooldown from another cause survives the aggregate recompute below.
+	keepCooldown := !authLevel && auth.NextRetryAfter.After(now)
+	prevUnavailable, prevRetryAfter := auth.Unavailable, auth.NextRetryAfter
+	modelReset := false
 	for _, state := range auth.ModelStates {
 		if state == nil || !metaADRejectionError(state.LastError) {
 			continue
@@ -325,8 +336,17 @@ func metaADClearRejectionLeftovers(auth *Auth, now time.Time) {
 			continue
 		}
 		resetModelState(state, now)
+		modelReset = true
 	}
-	updateAggregatedAvailability(auth, now)
+	if modelReset {
+		updateAggregatedAvailability(auth, now)
+		if keepCooldown {
+			auth.Unavailable = prevUnavailable
+			auth.NextRetryAfter = prevRetryAfter
+		}
+		changed = true
+	}
+	return changed
 }
 
 // metaADBlocks reports whether selection must skip the credential. It is checked
@@ -528,7 +548,8 @@ func (m *Manager) metaAutoDisablePreRefresh(auth *Auth, force bool, failedToken 
 // be skipped. base is the credential as it was handed to the refresh. The whole
 // transition runs under the per-auth mutation gate.
 func (m *Manager) metaAutoDisableOnRefreshError(id string, base *Auth, err error, force bool, now time.Time) bool {
-	if !metaADEligible(base) {
+	// With the switch off and nothing tracked, stay out of the way entirely: no gate.
+	if !metaADEligible(base) || (base.metaAD.state == "" && !m.metaAutoDisableEnabled()) {
 		return false
 	}
 	handled := false
@@ -598,10 +619,12 @@ func (m *Manager) metaAutoDisableOnRefreshSaveError(id string, before *Auth) {
 // is the key the mint produced. It does nothing unless that key is the one now installed
 // (checked under the mutation gate): a refresh that was discarded as stale must not touch
 // the credential that replaced it.
-// It ends the tracking of a credential that was awaiting confirmation (or sends it back
-// to retry when the mint left the credentials unchanged, so it cannot be restored), clears
-// what the rejection left behind, and stamps the replaced-key window when the mint
-// followed a rejected key. before is the credential as it was handed to the refresh.
+// It sends a tracked credential back to retry when the mint left the credentials
+// unchanged (so it cannot be restored), and stamps the replaced-key window when the mint
+// followed a rejected key and produced a different one. A mint that changed the key was
+// already settled inside the commit by metaADFinishUpdate, which ends the tracking and
+// clears what the rejection left behind in the same locked step, so no concurrent update
+// can slip in between. before is the credential as it was handed to the refresh.
 // It returns a fresh snapshot when the live auth changed.
 func (m *Manager) metaAutoDisableAfterRefresh(saved, before *Auth, mintedKey, failedToken string) *Auth {
 	if saved == nil || !metaADEligible(saved) || mintedKey == "" {
@@ -609,7 +632,8 @@ func (m *Manager) metaAutoDisableAfterRefresh(saved, before *Auth, mintedKey, fa
 	}
 	wasTracked := before.metaAD.tracked(before)
 	enabled := m.metaAutoDisableEnabled()
-	stamp := enabled && failedToken != "" && !wasTracked
+	// A mint that hands back the rejected key is no evidence about a replacement key.
+	stamp := enabled && failedToken != "" && !wasTracked && mintedKey != metaADKey(before)
 	if !wasTracked && !stamp {
 		return saved
 	}
@@ -625,7 +649,6 @@ func (m *Manager) metaAutoDisableAfterRefresh(saved, before *Auth, mintedKey, fa
 				metaADEnterRetry(live, now)
 			} else {
 				live.metaAD.clearPending()
-				metaADClearRejectionLeftovers(live, now)
 			}
 			return true
 		}
@@ -642,40 +665,59 @@ func (m *Manager) metaAutoDisableAfterRefresh(saved, before *Auth, mintedKey, fa
 	return saved
 }
 
-// metaADFinishUpdate decides what an Update does with the in-memory state. Refresh and
-// prepare merges start from the live auth, which already carries it. A replacing update
-// (a reload, a re-login) builds a new object: the state is carried over only while the
-// key and dca_token are unchanged, together with the confirmation time and blocked
-// shape the generic merge does not copy for every update path. When the credential was
-// replaced the state is dropped and the blocked shape inherited from the old object goes
-// with it.
-func metaADFinishUpdate(auth, existing *Auth, mode updateAuthMode) {
-	if mode != updateModeReplace || auth == nil || existing == nil ||
+// metaADFinishUpdate runs inside updateInternalLocked, under the mutation gate, after the
+// generic merge. It reports whether it changed cooldown state that the cooldown store tracks.
+// Replacing updates (a reload, a re-login) build a new object, so the in-memory state is
+// carried over from the live auth; refresh and prepare merges start from the live auth and
+// already carry it. Then:
+//   - same key and dca_token: the state stays, and a replacing update also gets the
+//     confirmation time and blocked shape the generic merge does not copy for every update
+//     path;
+//   - the key or dca_token the state was entered with is gone (the refresh itself minted a
+//     new key, a re-login, a reload): the state is voided, and when it came from a rejected
+//     mint the 401/403 leftovers of that rejection are cleared in this same step. Doing it
+//     here, and not in a separate step after the commit, leaves no window in which another
+//     update could void the state first and strand the leftovers.
+func metaADFinishUpdate(auth, existing *Auth, mode updateAuthMode, now time.Time) bool {
+	if auth == nil || existing == nil ||
 		auth.Disabled || auth.Status == StatusDisabled || existing.Disabled || existing.Status == StatusDisabled {
-		return
+		return false
 	}
-	auth.metaAD = existing.metaAD
-	if existing.metaAD.state == "" {
-		return
+	if mode == updateModeReplace {
+		auth.metaAD = existing.metaAD
 	}
-	if !existing.metaAD.tracked(auth) {
-		auth.metaAD.clearPending()
-		if existing.Unavailable && auth.Unavailable && auth.Status == StatusError {
-			auth.Unavailable = false
-			auth.Status = StatusActive
-			auth.NextRefreshAfter = time.Time{}
-			auth.NextRetryAfter = time.Time{}
-			auth.StatusMessage = ""
-			auth.LastError = nil
+	if auth.metaAD.state == "" {
+		return false
+	}
+	if auth.metaAD.tracked(auth) {
+		if mode != updateModeReplace {
+			return false
 		}
-		return
+		due := existing.NextRefreshAfter
+		if auth.NextRefreshAfter.After(due) {
+			due = auth.NextRefreshAfter
+		}
+		if due.IsZero() {
+			due = now.Add(metaADConfirmDelay)
+		}
+		metaADApplyBlocked(auth, due, auth.metaAD.reason)
+		return false
 	}
-	due := existing.NextRefreshAfter
-	if auth.NextRefreshAfter.After(due) {
-		due = auth.NextRefreshAfter
+	rejectedMint := auth.metaAD.reason == metaADReasonMintRejected
+	auth.metaAD.clearPending()
+	changed := false
+	if rejectedMint {
+		changed = metaADClearRejectionLeftovers(auth, now)
 	}
-	if due.IsZero() {
-		due = time.Now().Add(metaADConfirmDelay)
+	// A replacing update inherits the blocked shape from the old object; drop it with the state.
+	if mode == updateModeReplace && existing.Unavailable && auth.Unavailable && auth.Status == StatusError {
+		auth.Unavailable = false
+		auth.Status = StatusActive
+		auth.NextRefreshAfter = time.Time{}
+		auth.NextRetryAfter = time.Time{}
+		auth.StatusMessage = ""
+		auth.LastError = nil
+		changed = true
 	}
-	metaADApplyBlocked(auth, due, existing.metaAD.reason)
+	return changed
 }

@@ -1589,3 +1589,73 @@ func TestMetaAutoDisable_ConcurrentRejectionsDoNotBypassConfirmationDelay(t *tes
 		t.Fatalf("Refresh calls after the sequential request = %d, want 1", got)
 	}
 }
+
+func TestMetaAutoDisable_SameKeyMintIsNotStampedAsReplacement(t *testing.T) {
+	paths := map[string]func(t *testing.T, m *Manager, exec *metaADTestExecutor){
+		"Execute": func(t *testing.T, m *Manager, _ *metaADTestExecutor) {
+			resp, err := metaADExecute(m, metaADModelA)
+			if err != nil || string(resp.Payload) != metaADBackupID+":good-key" {
+				t.Fatalf("Execute = (%q, %v), want backup response", resp.Payload, err)
+			}
+		},
+		"ExecuteStream error": func(t *testing.T, m *Manager, _ *metaADTestExecutor) {
+			got, err := metaADExecuteStream(m, metaADModelA)
+			if err != nil || got != metaADBackupID+":good-key" {
+				t.Fatalf("ExecuteStream = (%q, %v), want backup payload", got, err)
+			}
+		},
+		"ExecuteStream bootstrap": func(t *testing.T, m *Manager, exec *metaADTestExecutor) {
+			exec.streamChunkErr = true
+			got, err := metaADExecuteStream(m, metaADModelA)
+			if err != nil || got != metaADBackupID+":good-key" {
+				t.Fatalf("ExecuteStream = (%q, %v), want backup payload", got, err)
+			}
+		},
+	}
+	for name, run := range paths {
+		t.Run("same key/"+name, func(t *testing.T) {
+			exec := newMetaADTestExecutor("dead-key-0")
+			exec.enqueue(metaADRefreshResult{sameKey: true})
+			m := newMetaADManager(t, true, exec, metaADPrimary(), metaADBackup())
+
+			run(t, m, exec)
+
+			if got := exec.RefreshCalls(); got != 1 {
+				t.Fatalf("Refresh calls = %d, want exactly 1", got)
+			}
+			if got := exec.CallsFor(metaADPrimaryID); got != 2 {
+				t.Fatalf("primary upstream calls = %d, want 2 (original and retry, both dead-key-0)", got)
+			}
+			got := metaADGet(t, m, metaADPrimaryID)
+			metaADRequireNotTracked(t, got)
+			raw := metaADRawState(m, metaADPrimaryID)
+			if raw.state != "" || raw.replacedKey != "" || !raw.replacedAt.IsZero() {
+				t.Fatalf("raw metaAD = %+v, want empty: an unchanged key is not a replacement", raw)
+			}
+			// Pre-existing rule for a rejected key that came back unchanged.
+			if got.RejectedAccessToken != "dead-key-0" {
+				t.Fatalf("RejectedAccessToken = %q, want dead-key-0", got.RejectedAccessToken)
+			}
+			now := time.Now()
+			for _, model := range []string{metaADModelA, metaADModelB, metaADModelC, ""} {
+				blocked, _, next := isAuthBlockedForModel(got, model, now)
+				if !blocked || !next.IsZero() {
+					t.Fatalf("model %q: blocked=%v next=%v, want blocked with no recovery time", model, blocked, next)
+				}
+			}
+		})
+	}
+
+	t.Run("control: different dead key is new_key_rejected", func(t *testing.T) {
+		exec := newMetaADTestExecutor("dead-key-0")
+		exec.enqueue(metaADRefreshResult{mintInvalid: true})
+		m := newMetaADManager(t, true, exec, metaADPrimary(), metaADBackup())
+		if _, err := metaADExecute(m, metaADModelA); err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		metaADRequireTracked(t, metaADGet(t, m, metaADPrimaryID), metaADStatePending, metaADReasonNewKeyRejected)
+		if raw := metaADRawState(m, metaADPrimaryID); raw.replacedKey != metaADTokenFingerprint("minted-key-1") {
+			t.Fatalf("raw metaAD = %+v, want the minted key stamped", raw)
+		}
+	})
+}

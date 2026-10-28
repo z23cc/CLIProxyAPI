@@ -44,6 +44,8 @@ type metaADFxExecutor struct {
 	mintSeq      int
 	calls        []string
 	prepareCalls int
+	// hold, when set, runs inside Refresh before the outcome is returned.
+	hold func()
 }
 
 func newMetaADFxExecutor(invalid ...string) *metaADFxExecutor {
@@ -103,7 +105,11 @@ func (e *metaADFxExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error)
 		e.mintSeq++
 	}
 	seq := e.mintSeq
+	hold := e.hold
 	e.mu.Unlock()
+	if hold != nil {
+		hold()
+	}
 	if outcome != nil {
 		return nil, outcome
 	}
@@ -229,7 +235,12 @@ func metaADFxBackup() *Auth  { return metaADFxKeyAuth(metaADFxBackupID, "good-ke
 
 func newMetaADFxManager(t *testing.T, enabled bool, store Store, exec ProviderExecutor, auths ...*Auth) *Manager {
 	t.Helper()
-	m := NewManager(store, nil, nil)
+	return newMetaADFxManagerWithHook(t, enabled, store, nil, exec, auths...)
+}
+
+func newMetaADFxManagerWithHook(t *testing.T, enabled bool, store Store, hook Hook, exec ProviderExecutor, auths ...*Auth) *Manager {
+	t.Helper()
+	m := NewManager(store, nil, hook)
 	m.RegisterExecutor(exec)
 	m.SetConfig(metaADFxSwitch(enabled))
 	reg := registry.GetGlobalRegistry()
@@ -913,4 +924,345 @@ func TestMetaAutoDisableFixup_RefreshErrorTransitionSurvivesConcurrentSave(t *te
 			tc.check(t, got, metaADFxRaw(m, metaADFxPrimaryID), before, after)
 		})
 	}
+}
+
+// metaADFxHook runs fn once, on the first OnAuthUpdated after arm(). That call is the
+// post-commit hook of a refresh, fired after the mutation gate was released.
+type metaADFxHook struct {
+	NoopHook
+	mu    sync.Mutex
+	armed bool
+	fired int
+	fn    func(ctx context.Context, committed *Auth)
+}
+
+func (h *metaADFxHook) arm() {
+	h.mu.Lock()
+	h.armed = true
+	h.mu.Unlock()
+}
+
+func (h *metaADFxHook) firedCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.fired
+}
+
+func (h *metaADFxHook) OnAuthUpdated(ctx context.Context, committed *Auth) {
+	h.mu.Lock()
+	if !h.armed {
+		h.mu.Unlock()
+		return
+	}
+	h.armed = false
+	h.fired++
+	fn := h.fn
+	h.mu.Unlock()
+	if fn != nil {
+		fn(ctx, committed)
+	}
+}
+
+// metaADFxFirstMintFlow builds the F6 situation: a DCA-only credential whose first mint
+// was rejected with status, leaving the rejection leftovers, plus an unrelated 429 quota
+// state on model-c. It returns the manager, the executor and that state's recovery time.
+func metaADFxFirstMintFlow(t *testing.T, status int, hook Hook) (*Manager, *metaADFxPreparer, time.Time) {
+	t.Helper()
+	exec := &metaADFxPreparer{metaADFxExecutor: newMetaADFxExecutor()}
+	exec.enqueue(metaADFxMintErr(status))
+	m := newMetaADFxManagerWithHook(t, true, nil, hook, exec, metaADFxDCAOnlyAuth(), metaADFxBackup())
+	if _, err := metaADFxExecute(m, metaADFxModelA); err != nil {
+		t.Fatalf("Execute error = %v, want success via backup", err)
+	}
+	pending := metaADFxGet(t, m, metaADFxPrimaryID)
+	metaADFxRequireTracked(t, pending, metaADStatePending, metaADReasonMintRejected)
+	stA := pending.ModelStates[metaADFxModelA]
+	if pending.LastError == nil || pending.LastError.StatusCode() != status || pending.StatusMessage == "" || pending.NextRetryAfter.IsZero() ||
+		stA == nil || !stA.Unavailable || stA.LastError == nil || stA.LastError.StatusCode() != status || stA.NextRetryAfter.IsZero() {
+		t.Fatalf("precondition: want %d leftovers on the auth and on model-a, got auth=%+v model-a=%+v", status, pending.LastError, stA)
+	}
+	recoverAt := time.Now().Add(10 * time.Minute)
+	m.mu.Lock()
+	m.auths[metaADFxPrimaryID].ModelStates[metaADFxModelC] = &ModelState{
+		Status:         StatusError,
+		StatusMessage:  "quota exceeded",
+		Unavailable:    true,
+		NextRetryAfter: recoverAt,
+		LastError:      &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exceeded"},
+		Quota:          QuotaState{Exceeded: true, Reason: "quota exceeded", NextRecoverAt: recoverAt},
+	}
+	m.mu.Unlock()
+	return m, exec, recoverAt
+}
+
+// metaADFxRequireRestored asserts a fully restored credential: untracked, no leftovers on
+// the auth or on model-a, model-c's quota state untouched, selectable for every model.
+func metaADFxRequireRestored(t *testing.T, m *Manager, recoverAt time.Time) {
+	t.Helper()
+	got := metaADFxGet(t, m, metaADFxPrimaryID)
+	metaADFxRequireNotTracked(t, got)
+	if got.Unavailable || got.Status == StatusError {
+		t.Fatalf("Unavailable=%v Status=%v, want available and not in error", got.Unavailable, got.Status)
+	}
+	if !got.NextRetryAfter.IsZero() || !got.NextRefreshAfter.IsZero() {
+		t.Fatalf("NextRetryAfter=%v NextRefreshAfter=%v, want both zero", got.NextRetryAfter, got.NextRefreshAfter)
+	}
+	if got.LastError != nil || got.StatusMessage != "" {
+		t.Fatalf("LastError=%+v StatusMessage=%q, want cleared", got.LastError, got.StatusMessage)
+	}
+	if st := got.ModelStates[metaADFxModelA]; st != nil && (st.Unavailable || !st.NextRetryAfter.IsZero() || st.LastError != nil) {
+		t.Fatalf("model-a rejection state not reset: %+v", st)
+	}
+	stC := got.ModelStates[metaADFxModelC]
+	if stC == nil || !stC.Unavailable || !stC.NextRetryAfter.Equal(recoverAt) || !stC.Quota.Exceeded || stC.LastError == nil || stC.LastError.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("unrelated quota state was touched: %+v", stC)
+	}
+	now := time.Now()
+	for _, model := range []string{metaADFxModelA, metaADFxModelB, ""} {
+		if blocked, _, _ := isAuthBlockedForModel(got, model, now); blocked {
+			t.Fatalf("auth still blocked for model %q", model)
+		}
+	}
+}
+
+// R1: the leftovers are cleared inside the commit, so an Update landing right after the
+// commit (before the post-commit steps) cannot strand them.
+func TestMetaAutoDisableFixup2_FirstMintRejectionLeftoversClearedDespiteInterleavedUpdate(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusUnauthorized} {
+		t.Run(fmt.Sprintf("mint_%d", status), func(t *testing.T) {
+			hook := &metaADFxHook{}
+			m, exec, recoverAt := metaADFxFirstMintFlow(t, status, hook)
+			hook.fn = func(ctx context.Context, committed *Auth) {
+				// A plain replacing update of the committed credential, as a reload would do.
+				replacement := &Auth{ID: committed.ID, Provider: committed.Provider, Metadata: map[string]any{}, Attributes: map[string]string{}}
+				for k, v := range committed.Metadata {
+					replacement.Metadata[k] = v
+				}
+				for k, v := range committed.Attributes {
+					replacement.Attributes[k] = v
+				}
+				if _, err := m.Update(ctx, replacement); err != nil {
+					t.Errorf("interleaved Update: %v", err)
+				}
+			}
+
+			metaADFxMakeDue(m, metaADFxPrimaryID)
+			hook.arm()
+			m.refreshAuth(context.Background(), metaADFxPrimaryID)
+
+			if got := hook.firedCount(); got != 1 {
+				t.Fatalf("hook fired %d times, want 1 (the interleaved Update did not run)", got)
+			}
+			if got := exec.refreshCount(); got != 2 {
+				t.Fatalf("Refresh calls = %d, want 2", got)
+			}
+			metaADFxRequireRestored(t, m, recoverAt)
+		})
+	}
+}
+
+// metaADFxSeedModelState installs a model state on the live auth.
+func metaADFxSeedModelState(m *Manager, id, model string, st *ModelState) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	live := m.auths[id]
+	if live.ModelStates == nil {
+		live.ModelStates = make(map[string]*ModelState)
+	}
+	live.ModelStates[model] = st
+}
+
+func TestMetaAutoDisableFixup2_ReplacedCredentialClearsRejectedMintLeftovers(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusUnauthorized} {
+		t.Run(fmt.Sprintf("mint_%d", status), func(t *testing.T) {
+			m, _, recoverAt := metaADFxFirstMintFlow(t, status, nil)
+			relogin := metaADFxKeyAuth(metaADFxPrimaryID, "relogin-key", "dca:relogin")
+			if _, err := m.Update(context.Background(), relogin); err != nil {
+				t.Fatalf("Update: %v", err)
+			}
+			if raw := metaADFxRaw(m, metaADFxPrimaryID); raw.state != "" {
+				t.Fatalf("raw state = %+v, want dropped", raw)
+			}
+			metaADFxRequireRestored(t, m, recoverAt)
+		})
+	}
+
+	// Only mint_rejected leftovers are cleared by the replacement.
+	for _, reason := range []string{metaADReasonNewKeyRejected, metaADReasonNoDCAToken} {
+		t.Run("control_"+reason, func(t *testing.T) {
+			dca := "dca:primary"
+			if reason == metaADReasonNoDCAToken {
+				dca = ""
+			}
+			exec := newMetaADFxExecutor()
+			m := newMetaADFxManager(t, true, nil, exec, metaADFxKeyAuth(metaADFxPrimaryID, "dead-key-0", dca))
+			retryAt := time.Now().Add(20 * time.Minute)
+			metaADFxSeedModelState(m, metaADFxPrimaryID, metaADFxModelA, &ModelState{
+				Status:         StatusError,
+				StatusMessage:  "forbidden",
+				Unavailable:    true,
+				NextRetryAfter: retryAt,
+				LastError:      &Error{HTTPStatus: http.StatusForbidden, Message: "forbidden"},
+			})
+			m.mu.Lock()
+			metaADEnterPending(m.auths[metaADFxPrimaryID], reason, time.Now())
+			m.mu.Unlock()
+			metaADFxRequireTracked(t, metaADFxGet(t, m, metaADFxPrimaryID), metaADStatePending, reason)
+
+			if _, err := m.Update(context.Background(), metaADFxKeyAuth(metaADFxPrimaryID, "relogin-key", "dca:relogin")); err != nil {
+				t.Fatalf("Update: %v", err)
+			}
+			if raw := metaADFxRaw(m, metaADFxPrimaryID); raw.state != "" {
+				t.Fatalf("raw state = %+v, want dropped", raw)
+			}
+			got := metaADFxGet(t, m, metaADFxPrimaryID)
+			metaADFxRequireNotTracked(t, got)
+			st := got.ModelStates[metaADFxModelA]
+			if st == nil || !st.Unavailable || !st.NextRetryAfter.Equal(retryAt) || st.LastError == nil || st.LastError.StatusCode() != http.StatusForbidden {
+				t.Fatalf("403 model state of a %s credential was touched: %+v", reason, st)
+			}
+		})
+	}
+}
+
+// metaADFxMarkAuthLevelFailure records an auth-level (empty model key) failure.
+func metaADFxMarkAuthLevelFailure(m *Manager, status int) {
+	retry := 30 * time.Minute
+	m.MarkResult(context.Background(), Result{
+		AuthID:     metaADFxPrimaryID,
+		Provider:   "meta",
+		Model:      "",
+		Success:    false,
+		Error:      &Error{HTTPStatus: status, Message: fmt.Sprintf("auth-level %d", status)},
+		RetryAfter: &retry,
+	})
+}
+
+func metaADFxRequireAuthLevelCooldown(t *testing.T, a *Auth, status int, when string) {
+	t.Helper()
+	if !a.Unavailable || !a.NextRetryAfter.After(time.Now()) || a.LastError == nil || a.LastError.StatusCode() != status {
+		t.Fatalf("%s: auth-level %d cooldown missing: unavailable=%v nextRetry=%v lastError=%+v", when, status, a.Unavailable, a.NextRetryAfter, a.LastError)
+	}
+}
+
+// G2: a confirmation must not wipe an auth-level cooldown that has another cause.
+func TestMetaAutoDisableFixup2_ConfirmationKeepsUnrelatedAuthLevelCooldown(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(fmt.Sprintf("no_model_states_%d", status), func(t *testing.T) {
+			exec := newMetaADFxExecutor()
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			exec.hold = func() {
+				close(entered)
+				<-release
+			}
+			m := newMetaADFxManager(t, true, nil, exec, metaADFxPrimary())
+			m.mu.Lock()
+			metaADEnterPending(m.auths[metaADFxPrimaryID], metaADReasonMintRejected, time.Now())
+			if n := len(m.auths[metaADFxPrimaryID].ModelStates); n != 0 {
+				m.mu.Unlock()
+				t.Fatalf("precondition: %d model states, want none", n)
+			}
+			m.mu.Unlock()
+			metaADFxMakeDue(m, metaADFxPrimaryID)
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				m.refreshAuth(context.Background(), metaADFxPrimaryID)
+			}()
+			<-entered
+			metaADFxMarkAuthLevelFailure(m, status)
+			during := metaADFxGet(t, m, metaADFxPrimaryID)
+			metaADFxRequireAuthLevelCooldown(t, during, status, "before the mint returns")
+			if status == http.StatusTooManyRequests && !during.Quota.Exceeded {
+				t.Logf("note: a 429 with RetryAfter left Quota.Exceeded=false (transient path)")
+			}
+			close(release)
+			<-done
+
+			got := metaADFxGet(t, m, metaADFxPrimaryID)
+			metaADFxRequireNotTracked(t, got)
+			if key := metaADKey(got); key != "fx-minted-1" {
+				t.Fatalf("key = %q, want the minted key", key)
+			}
+			metaADFxRequireAuthLevelCooldown(t, got, status, "after the confirmation")
+			if status == http.StatusTooManyRequests && got.Quota.Exceeded != during.Quota.Exceeded {
+				t.Fatalf("Quota.Exceeded = %v, want %v", got.Quota.Exceeded, during.Quota.Exceeded)
+			}
+		})
+	}
+
+	t.Run("mixed_model_and_auth_level", func(t *testing.T) {
+		m, _, recoverAt := metaADFxFirstMintFlow(t, http.StatusForbidden, nil)
+		metaADFxMarkAuthLevelFailure(m, http.StatusServiceUnavailable)
+		metaADFxRequireAuthLevelCooldown(t, metaADFxGet(t, m, metaADFxPrimaryID), http.StatusServiceUnavailable, "before the confirmation")
+
+		metaADFxMakeDue(m, metaADFxPrimaryID)
+		m.refreshAuth(context.Background(), metaADFxPrimaryID)
+
+		got := metaADFxGet(t, m, metaADFxPrimaryID)
+		metaADFxRequireNotTracked(t, got)
+		if st := got.ModelStates[metaADFxModelA]; st != nil && (st.Unavailable || !st.NextRetryAfter.IsZero() || st.LastError != nil) {
+			t.Fatalf("model-a 403 state not reset: %+v", st)
+		}
+		metaADFxRequireAuthLevelCooldown(t, got, http.StatusServiceUnavailable, "after the confirmation")
+		stC := got.ModelStates[metaADFxModelC]
+		if stC == nil || !stC.Unavailable || !stC.NextRetryAfter.Equal(recoverAt) {
+			t.Fatalf("unrelated quota state was touched: %+v", stC)
+		}
+	})
+}
+
+// P2: with the switch off and nothing tracked, a refresh failure never takes the gate.
+func TestMetaAutoDisableFixup2_SwitchOffRefreshErrorDoesNotTakeMutationGate(t *testing.T) {
+	run := func(t *testing.T, enabled bool) (waited bool, m *Manager, finish func()) {
+		exec := newMetaADFxExecutor()
+		exec.enqueue(metaADFxMintErr(http.StatusUnauthorized))
+		m = newMetaADFxManager(t, enabled, nil, exec, metaADFxPrimary())
+		releaseGate := m.lockAuthMutation(metaADFxPrimaryID)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			m.refreshAuth(context.Background(), metaADFxPrimaryID)
+		}()
+		state := m.metadataPersistPreempt(metaADFxPrimaryID)
+		for {
+			state.mu.Lock()
+			w := state.waiters
+			state.mu.Unlock()
+			if w >= 1 {
+				waited = true
+				break
+			}
+			select {
+			case <-done:
+				return false, m, releaseGate
+			default:
+				runtime.Gosched()
+			}
+		}
+		return waited, m, func() {
+			releaseGate()
+			<-done
+		}
+	}
+
+	t.Run("switch_off", func(t *testing.T) {
+		waited, _, finish := run(t, false)
+		finish()
+		if waited {
+			t.Fatalf("the refresh failure blocked on the mutation gate with the switch off")
+		}
+	})
+
+	t.Run("switch_on_needs_gate", func(t *testing.T) {
+		waited, m, finish := run(t, true)
+		if !waited {
+			finish()
+			t.Fatalf("the refresh failure finished without waiting for the gate with the switch on")
+		}
+		finish()
+		metaADFxRequireTracked(t, metaADFxGet(t, m, metaADFxPrimaryID), metaADStatePending, metaADReasonMintRejected)
+	})
 }
