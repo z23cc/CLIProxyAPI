@@ -84,6 +84,21 @@ func TestMetaAutoDisableFields_EnableClearsCoreMarkersOnly(t *testing.T) {
 		t.Fatalf("enable touched another writer's marker: %#v", foreign.Metadata)
 	}
 
+	// U1: an admin explicitly disabling a core-marked credential takes it over, so a later
+	// re-login keeps the disable instead of dropping it as a core auto-disable.
+	adminTakeover := &coreauth.Auth{Provider: "meta", Disabled: true, Metadata: map[string]any{
+		"disabled": true, "disabled_by": "cliproxyapi", "disabled_reason": "mint_rejected", "disabled_at": "2026-10-28T10:00:00Z",
+	}}
+	applyAuthDisabledState(adminTakeover, true)
+	if _, ok := adminTakeover.Metadata["disabled_by"]; ok {
+		t.Fatalf("explicit disable kept the core marker: %#v", adminTakeover.Metadata)
+	}
+	relogin := &coreauth.Auth{Provider: "meta", Metadata: map[string]any{"type": "meta", "access_token": "new-key"}}
+	coreauth.MergeExistingAuthMetadata(relogin, adminTakeover.Metadata)
+	if !relogin.Disabled {
+		t.Fatal("a re-login dropped the administrator's explicit disable")
+	}
+
 	patched := &coreauth.Auth{Provider: "meta", Disabled: true, Metadata: map[string]any{
 		"disabled": false, "disabled_by": "cliproxyapi", "disabled_reason": "no_dca_token",
 	}}

@@ -256,10 +256,10 @@ func applyAuthDisabledState(auth *coreauth.Auth, disabled bool) {
 		auth.Metadata = make(map[string]any)
 	}
 	auth.Metadata["disabled"] = disabled
-	if !disabled {
-		// Re-enabling ends a Meta auto-disable: its markers must not outlive it.
-		coreauth.ClearMetaAutoDisableMarkers(auth)
-	}
+	// An explicit management status change ends a Meta auto-disable either way: enabling
+	// lifts it, and disabling makes it an administrator's disable, which a later re-login
+	// must keep. The core's markers must not outlive it.
+	coreauth.ClearMetaAutoDisableMarkers(auth)
 }
 
 // PatchAuthFileFields updates arbitrary metadata fields of an auth file.
@@ -851,6 +851,8 @@ func syncAuthFileDisabledState(auth *coreauth.Auth) {
 		return
 	}
 	auth.Disabled = disabled
+	// An explicit disabled patch is an administrator's decision either way (see applyAuthDisabledState).
+	coreauth.ClearMetaAutoDisableMarkers(auth)
 	if disabled {
 		auth.Status = coreauth.StatusDisabled
 		if strings.TrimSpace(auth.StatusMessage) == "" {
@@ -860,7 +862,6 @@ func syncAuthFileDisabledState(auth *coreauth.Auth) {
 	}
 	auth.Status = coreauth.StatusActive
 	auth.StatusMessage = ""
-	coreauth.ClearMetaAutoDisableMarkers(auth)
 }
 
 func (h *Handler) removeAuth(ctx context.Context, id string) {
