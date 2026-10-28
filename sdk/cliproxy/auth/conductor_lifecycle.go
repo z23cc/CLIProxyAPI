@@ -382,11 +382,6 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	cooldownStateChanged := false
 	now := time.Now()
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
-		// Meta auto-disable state is in-memory only. A reload keeps it; a replaced credential voids it.
-		auth.metaAD = existing.metaAD
-		if credChanged && mode == updateModeReplace {
-			auth.metaAD.clearPending()
-		}
 		if isFileSnapshot {
 			auth.ModelStates = existing.ModelStates
 			auth.LastRefreshedAt = existing.LastRefreshedAt
@@ -466,6 +461,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			}
 		}
 	}
+	metaADFinishUpdate(auth, existing, mode)
 	auth.UpdatedAt = now
 	cooldownStateChanged = normalizeModelStates(auth) || cooldownStateChanged
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {

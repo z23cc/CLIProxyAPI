@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -136,16 +137,33 @@ func TestMetaUnauthorizedRemintFrequency(t *testing.T) {
 	}
 
 	// Only the first request mints (1 mint + 1 retry on the primary, both 401).
-	// That 401 suspends the primary at auth level (~30 min NextRetryAfter), so
-	// the selector skips it for every later request, on model A and on model B
-	// alike; it is never tried again, hence never re-minted. (The ~5 min
-	// NextRefreshAfter concerns the background refresher, not selection.)
+	// The retry's 401 is recorded by MarkResult, which stores the minted key as
+	// RejectedAccessToken. AccessTokenExpirationTime then reports that key as
+	// expired, so isAuthBlockedForModel blocks the primary for every model with
+	// no recovery time, and the refresh loop drops it (Meta has no refresh lead).
+	// It is never selected again, hence never re-minted, until a restart or a
+	// credential change. The ~30 min NextRetryAfter that the failure also sets is
+	// not what gates it: the check below holds well past that window.
 	want := []int{1, 1, 1, 1, 1}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("cumulative Refresh counts = %v, want %v", got, want)
 	}
 	if exec.primaryCalls != 2 {
 		t.Fatalf("primary upstream calls = %d, want 2 (original + one retry with the minted key)", exec.primaryCalls)
+	}
+
+	primary, ok := m.GetByID(metaRemintPrimaryID)
+	if !ok {
+		t.Fatal("primary auth missing")
+	}
+	if primary.RejectedAccessToken == "" || primary.RejectedAccessToken != authOuterAccessToken(primary) {
+		t.Fatalf("RejectedAccessToken = %q, want the minted key %q", primary.RejectedAccessToken, authOuterAccessToken(primary))
+	}
+	later := time.Now().Add(2 * time.Hour)
+	for _, model := range []string{metaRemintModelA, metaRemintModelB, ""} {
+		if blocked, _, next := isAuthBlockedForModel(primary, model, later); !blocked || !next.IsZero() {
+			t.Fatalf("model %q: blocked=%v next=%v two hours later, want blocked with no recovery time", model, blocked, next)
+		}
 	}
 }
 

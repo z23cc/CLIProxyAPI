@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -47,6 +48,14 @@ type metaADTestExecutor struct {
 	refreshCalls int
 	mintSeq      int
 	calls        []string
+
+	// streamChunkErr reports a rejected key as an error chunk of the stream (the bootstrap
+	// path) instead of an error returned by ExecuteStream.
+	streamChunkErr bool
+	// refreshEntered, when non-nil, gets a (non-blocking) send each time Refresh starts, and
+	// refreshRelease, when non-nil, blocks every Refresh until it is closed or sent to.
+	refreshEntered chan struct{}
+	refreshRelease chan struct{}
 }
 
 func newMetaADTestExecutor(invalidTokens ...string) *metaADTestExecutor {
@@ -94,6 +103,12 @@ func (e *metaADTestExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyex
 func (e *metaADTestExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	payload, err := e.run(auth)
 	if err != nil {
+		if e.streamChunkErr {
+			ch := make(chan cliproxyexecutor.StreamChunk, 1)
+			ch <- cliproxyexecutor.StreamChunk{Err: err}
+			close(ch)
+			return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
+		}
 		return nil, err
 	}
 	ch := make(chan cliproxyexecutor.StreamChunk, 1)
@@ -114,7 +129,17 @@ func (e *metaADTestExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, erro
 		e.mintSeq++
 	}
 	seq := e.mintSeq
+	entered, release := e.refreshEntered, e.refreshRelease
 	e.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if release != nil {
+		<-release
+	}
 	if res.err != nil {
 		return nil, res.err
 	}
@@ -581,61 +606,150 @@ func TestMetaAutoDisable_NoDCATokenNeverMints(t *testing.T) {
 	metaADRequireBlockedEverywhere(t, got)
 }
 
-func TestMetaAutoDisable_NewKeyRejectedSkipsSecondMint(t *testing.T) {
+// metaADExecuteStream runs one streaming request and drains the returned stream.
+func metaADExecuteStream(m *Manager, model string) (string, error) {
+	stream, err := m.ExecuteStream(context.Background(), []string{"meta"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if err != nil {
+		return "", err
+	}
+	var payload []byte
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			return "", chunk.Err
+		}
+		payload = append(payload, chunk.Payload...)
+	}
+	return string(payload), nil
+}
+
+func TestMetaAutoDisable_NewKeyRejectedEntersPendingInSameRequest(t *testing.T) {
+	paths := []struct {
+		name string
+		run  func(t *testing.T, m *Manager, exec *metaADTestExecutor)
+	}{
+		{"Execute", func(t *testing.T, m *Manager, _ *metaADTestExecutor) {
+			resp, err := metaADExecute(m, metaADModelA)
+			if err != nil {
+				t.Fatalf("Execute error = %v, want success via backup", err)
+			}
+			if got := string(resp.Payload); got != metaADBackupID+":good-key" {
+				t.Fatalf("payload = %q, want backup response", got)
+			}
+		}},
+		{"ExecuteStream error", func(t *testing.T, m *Manager, _ *metaADTestExecutor) {
+			got, err := metaADExecuteStream(m, metaADModelA)
+			if err != nil || got != metaADBackupID+":good-key" {
+				t.Fatalf("ExecuteStream = (%q, %v), want backup payload", got, err)
+			}
+		}},
+		{"ExecuteStream bootstrap", func(t *testing.T, m *Manager, exec *metaADTestExecutor) {
+			exec.streamChunkErr = true
+			got, err := metaADExecuteStream(m, metaADModelA)
+			if err != nil || got != metaADBackupID+":good-key" {
+				t.Fatalf("ExecuteStream = (%q, %v), want backup payload", got, err)
+			}
+		}},
+	}
+	for _, path := range paths {
+		t.Run(path.name, func(t *testing.T) {
+			exec := newMetaADTestExecutor("dead-key-0")
+			exec.enqueue(metaADRefreshResult{mintInvalid: true})
+			m := newMetaADManager(t, true, exec, metaADPrimary(), metaADBackup())
+
+			before := time.Now()
+			path.run(t, m, exec)
+			after := time.Now()
+
+			if got := exec.RefreshCalls(); got != 1 {
+				t.Fatalf("Refresh calls = %d, want exactly 1", got)
+			}
+			if got := exec.CallsFor(metaADPrimaryID); got != 2 {
+				t.Fatalf("primary upstream calls = %d, want 2 (old key, then minted key)", got)
+			}
+			got := metaADGet(t, m, metaADPrimaryID)
+			metaADRequireTracked(t, got, metaADStatePending, metaADReasonNewKeyRejected)
+			metaADRequireDueIn(t, got, before, after, metaADConfirmDelay)
+			if got.metaAD.replacedKey == "" {
+				t.Fatalf("replacedKey is empty, want the minted key's fingerprint")
+			}
+			if hasUnauthorizedAuthFailure(got) {
+				t.Fatalf("hasUnauthorizedAuthFailure = true, want false")
+			}
+			metaADRequireBlockedEverywhere(t, got)
+
+			// The tracked auth is scheduled and refreshed when due, not stuck in a silent block.
+			at := time.Now().Add(metaADConfirmDelay + time.Minute)
+			if next, schedule := nextRefreshCheckAt(at, got, time.Second); !schedule || !next.Equal(at) {
+				t.Fatalf("nextRefreshCheckAt = (%v, %v), want (%v, true)", next, schedule, at)
+			}
+			if !m.shouldRefresh(got, at) {
+				t.Fatalf("shouldRefresh = false once the confirmation is due")
+			}
+
+			// Confirmation never mints for new_key_rejected and ends confirmed.
+			metaADConfirmDue(m, metaADPrimaryID)
+			if got := exec.RefreshCalls(); got != 1 {
+				t.Fatalf("Refresh calls after confirmation = %d, want 1", got)
+			}
+			got = metaADGet(t, m, metaADPrimaryID)
+			metaADRequireTracked(t, got, metaADStatePending, metaADReasonNewKeyRejected)
+			if !got.metaAD.confirmed {
+				t.Fatalf("metaAD.confirmed = false, want true")
+			}
+			metaADRequireBlockedShape(t, got, metaADReasonNewKeyRejected)
+		})
+	}
+}
+
+func TestMetaAutoDisable_NewKeyRejectedSwitchOffControl(t *testing.T) {
 	exec := newMetaADTestExecutor("dead-key-0")
 	exec.enqueue(metaADRefreshResult{mintInvalid: true})
-	m := newMetaADManager(t, true, exec, metaADPrimary(), metaADBackup())
+	m := newMetaADManager(t, false, exec, metaADPrimary(), metaADBackup())
+	if _, err := metaADExecute(m, metaADModelA); err != nil {
+		t.Fatalf("Execute error = %v, want success via backup", err)
+	}
+	if exec.RefreshCalls() != 1 || exec.CallsFor(metaADPrimaryID) != 2 {
+		t.Fatalf("Refresh calls = %d, primary calls = %d, want 1 and 2", exec.RefreshCalls(), exec.CallsFor(metaADPrimaryID))
+	}
+	if raw := metaADRawState(m, metaADPrimaryID); raw != (metaAutoDisableState{}) {
+		t.Fatalf("raw metaAD = %+v, want empty with the switch off", raw)
+	}
+	got := metaADGet(t, m, metaADPrimaryID)
+	metaADRequireNotTracked(t, got)
+	// Pre-existing behaviour: the failed retry is a plain 401 cooldown.
+	if !got.Unavailable || got.NextRetryAfter.IsZero() {
+		t.Fatalf("unavailable=%v nextRetry=%v, want the legacy 401 cooldown", got.Unavailable, got.NextRetryAfter)
+	}
+}
 
-	// Request 1: the old key is rejected, the mint succeeds, the minted key is rejected as well.
-	// The retry's 401 does not go back through the unauthorized hook, so nothing is tracked yet;
-	// the normal failover cooldown applies and the minted key is remembered as freshly replaced.
+func TestMetaAutoDisable_NewKeyRejectedOnSecondRequestSkipsMint(t *testing.T) {
+	exec := newMetaADTestExecutor("dead-key-0")
+	m := newMetaADManager(t, true, exec, metaADPrimary(), metaADBackup())
+	// The live key was minted to replace a rejected key a moment ago.
+	m.mu.Lock()
+	m.auths[metaADPrimaryID].metaAD.replacedKey = metaADTokenFingerprint("dead-key-0")
+	m.auths[metaADPrimaryID].metaAD.replacedAt = time.Now()
+	m.mu.Unlock()
+
+	before := time.Now()
 	resp, err := metaADExecute(m, metaADModelA)
+	after := time.Now()
 	if err != nil {
 		t.Fatalf("Execute error = %v, want success via backup", err)
 	}
 	if got := string(resp.Payload); got != metaADBackupID+":good-key" {
 		t.Fatalf("payload = %q, want backup response", got)
 	}
-	if got := exec.RefreshCalls(); got != 1 {
-		t.Fatalf("Refresh calls = %d, want exactly 1", got)
+	if got := exec.RefreshCalls(); got != 0 {
+		t.Fatalf("Refresh calls = %d, want 0 (no second mint)", got)
 	}
-	if got := exec.CallsFor(metaADPrimaryID); got != 2 {
-		t.Fatalf("primary upstream calls = %d, want 2 (old key, then minted key)", got)
-	}
-	metaADRequireNotTracked(t, metaADGet(t, m, metaADPrimaryID))
-	if raw := metaADRawState(m, metaADPrimaryID); raw.replacedKey == "" || time.Since(raw.replacedAt) > 10*time.Second || raw.replacedAt.After(time.Now()) {
-		t.Fatalf("raw metaAD = %+v, want the replaced-key window stamped just now", raw)
-	}
-
-	// A later request (after the failover cooldown) hits another 401 on the minted key inside the
-	// window. The cooldown cannot be fast-forwarded through the scheduler without a clock, so the
-	// unauthorized recovery entry that request uses is called directly.
-	live := metaADGet(t, m, metaADPrimaryID)
-	if token := authAccessToken(live); token != "minted-key-1" {
-		t.Fatalf("live key = %q, want minted-key-1", token)
-	}
-	if _, retried := m.tryRefreshAfterUnauthorized(context.Background(), live, &Error{HTTPStatus: http.StatusUnauthorized}, false); retried {
-		t.Fatalf("tryRefreshAfterUnauthorized retried, want no second mint")
-	}
-	if got := exec.RefreshCalls(); got != 1 {
-		t.Fatalf("Refresh calls after second rejection = %d, want 1 (no second mint)", got)
+	if got := exec.CallsFor(metaADPrimaryID); got != 1 {
+		t.Fatalf("primary upstream calls = %d, want 1", got)
 	}
 	got := metaADGet(t, m, metaADPrimaryID)
 	metaADRequireTracked(t, got, metaADStatePending, metaADReasonNewKeyRejected)
-	metaADRequireBlockedShape(t, got, metaADReasonNewKeyRejected)
+	metaADRequireDueIn(t, got, before, after, metaADConfirmDelay)
 	metaADRequireBlockedEverywhere(t, got)
-
-	// Confirmation never mints for new_key_rejected.
-	metaADConfirmDue(m, metaADPrimaryID)
-	if got := exec.RefreshCalls(); got != 1 {
-		t.Fatalf("Refresh calls after confirmation = %d, want 1", got)
-	}
-	got = metaADGet(t, m, metaADPrimaryID)
-	metaADRequireTracked(t, got, metaADStatePending, metaADReasonNewKeyRejected)
-	if !got.metaAD.confirmed {
-		t.Fatalf("metaAD.confirmed = false, want true")
-	}
-	metaADRequireBlockedShape(t, got, metaADReasonNewKeyRejected)
 }
 
 func TestMetaAutoDisable_RejectionOutsideReplacedKeyWindowMintsNormally(t *testing.T) {
@@ -1193,4 +1307,285 @@ func TestMetaAutoDisable_ConfirmationRejectedKeyWithSwitchOffClearsTracking(t *t
 		t.Fatalf("raw metaAD = %+v, want tracking cleared with the switch off", raw)
 	}
 	metaADRequireNotTracked(t, metaADGet(t, m, metaADPrimaryID))
+}
+
+// metaADBlockedRefresh starts fn in a goroutine and waits until the executor's Refresh
+// (or PrepareRequestAuth) is in flight and blocked. The returned release lets it go;
+// wait returns what fn returned.
+func metaADBlockedRefresh(t *testing.T, exec *metaADTestExecutor, fn func() error) (release func(), wait func() error) {
+	t.Helper()
+	exec.mu.Lock()
+	exec.refreshEntered = make(chan struct{}, 4)
+	exec.refreshRelease = make(chan struct{})
+	entered, rel := exec.refreshEntered, exec.refreshRelease
+	exec.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	<-entered
+	return func() { close(rel) }, func() error { return <-done }
+}
+
+func metaADReplacementAuth(withDCA bool) *Auth {
+	a := &Auth{
+		ID:       metaADPrimaryID,
+		Provider: "meta",
+		Metadata: map[string]any{"access_token": "login-key-9", "api_key": "login-key-9"},
+	}
+	if withDCA {
+		a.Metadata["dca_token"] = "dca:login"
+	}
+	return a
+}
+
+// metaADRequireUntouched asserts the live credential carries no auto-disable effect.
+func metaADRequireUntouched(t *testing.T, m *Manager, id string) {
+	t.Helper()
+	got := metaADGet(t, m, id)
+	metaADRequireNotTracked(t, got)
+	if raw := metaADRawState(m, id); raw.state != "" {
+		t.Fatalf("raw metaAD = %+v, want no tracking", raw)
+	}
+	if got.Unavailable || !got.NextRefreshAfter.IsZero() {
+		t.Fatalf("unavailable=%v nextRefresh=%v, want an untouched credential", got.Unavailable, got.NextRefreshAfter)
+	}
+	for _, model := range []string{metaADModelA, metaADModelB, ""} {
+		if blocked, _, _ := isAuthBlockedForModel(got, model, time.Now()); blocked {
+			t.Fatalf("credential blocked for model %q, want selectable", model)
+		}
+	}
+}
+
+func TestMetaAutoDisable_StaleMintFailureAfterCredentialReplacementIsIgnored(t *testing.T) {
+	for _, withDCA := range []bool{true, false} {
+		t.Run(fmt.Sprintf("replacement_dca_%v", withDCA), func(t *testing.T) {
+			exec := newMetaADTestExecutor()
+			exec.enqueue(metaADRefreshResult{err: metaADMintErr(http.StatusUnauthorized)})
+			m := newMetaADManager(t, true, exec, metaADPrimary(), metaADBackup())
+
+			release, wait := metaADBlockedRefresh(t, exec, func() error {
+				_, err := m.refreshAuthForRequest(context.Background(), metaADPrimaryID, "dead-key-0")
+				return err
+			})
+			if _, err := m.Update(context.Background(), metaADReplacementAuth(withDCA)); err != nil {
+				t.Fatalf("Update: %v", err)
+			}
+			release()
+			if err := wait(); err == nil {
+				t.Fatalf("refresh error = nil, want the mint error")
+			}
+
+			if got := exec.RefreshCalls(); got != 1 {
+				t.Fatalf("Refresh calls = %d, want 1", got)
+			}
+			metaADRequireUntouched(t, m, metaADPrimaryID)
+			if !withDCA {
+				// Nothing is stuck in retry: a later refresh neither tracks nor changes the key.
+				m.refreshAuth(context.Background(), metaADPrimaryID)
+				metaADRequireUntouched(t, m, metaADPrimaryID)
+				live := metaADGet(t, m, metaADPrimaryID)
+				if key := metaADKey(live); key != "login-key-9" {
+					t.Fatalf("key = %q, want login-key-9 (nothing was minted)", key)
+				}
+				if m.shouldRefresh(live, time.Now()) {
+					t.Fatalf("shouldRefresh = true for the replacement, want false")
+				}
+			}
+		})
+	}
+}
+
+func TestMetaAutoDisable_StaleMintFailureAfterEpochChangeIsIgnored(t *testing.T) {
+	exec := newMetaADTestExecutor()
+	exec.enqueue(metaADRefreshResult{err: metaADMintErr(http.StatusUnauthorized)})
+	m := newMetaADManager(t, true, exec, metaADPrimary(), metaADBackup())
+
+	release, wait := metaADBlockedRefresh(t, exec, func() error {
+		_, err := m.refreshAuthForRequest(context.Background(), metaADPrimaryID, "dead-key-0")
+		return err
+	})
+	// Same key and dca_token, new registration epoch.
+	epochBefore := metaADGet(t, m, metaADPrimaryID).RegistrationEpoch
+	m.Remove(context.Background(), metaADPrimaryID)
+	if _, err := m.Register(context.Background(), metaADPrimary()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if epochAfter := metaADGet(t, m, metaADPrimaryID).RegistrationEpoch; epochAfter == epochBefore {
+		t.Fatalf("precondition: registration epoch did not change (%d)", epochAfter)
+	}
+	release()
+	if err := wait(); err == nil {
+		t.Fatalf("refresh error = nil, want the mint error")
+	}
+	metaADRequireUntouched(t, m, metaADPrimaryID)
+}
+
+func TestMetaAutoDisable_StalePrepareFailureAfterReplacementIsIgnored(t *testing.T) {
+	replace := map[string]func(t *testing.T, m *Manager){
+		"credential changed": func(t *testing.T, m *Manager) {
+			a := &Auth{ID: metaADPrimaryID, Provider: "meta", Metadata: map[string]any{"dca_token": "dca:login"}}
+			if _, err := m.Update(context.Background(), a); err != nil {
+				t.Fatalf("Update: %v", err)
+			}
+		},
+		"epoch changed": func(t *testing.T, m *Manager) {
+			m.Remove(context.Background(), metaADPrimaryID)
+			if _, err := m.Register(context.Background(), metaADDCAOnlyAuth()); err != nil {
+				t.Fatalf("Register: %v", err)
+			}
+		},
+	}
+	for name, doReplace := range replace {
+		t.Run(name, func(t *testing.T) {
+			exec := &metaADPreparerExecutor{metaADTestExecutor: newMetaADTestExecutor()}
+			exec.enqueue(metaADRefreshResult{err: metaADMintErr(http.StatusForbidden)})
+			m := newMetaADManager(t, true, exec, metaADDCAOnlyAuth(), metaADBackup())
+
+			release, wait := metaADBlockedRefresh(t, exec.metaADTestExecutor, func() error {
+				_, err := m.PrepareRequestAuth(context.Background(), exec, metaADGet(t, m, metaADPrimaryID))
+				return err
+			})
+			doReplace(t, m)
+			release()
+			if err := wait(); err == nil {
+				t.Fatalf("prepare error = nil, want the mint error")
+			}
+			metaADRequireUntouched(t, m, metaADPrimaryID)
+		})
+	}
+}
+
+func TestMetaAutoDisable_TrackedCredentialWithoutDCATokenIsReleased(t *testing.T) {
+	exec := newMetaADTestExecutor()
+	primary := &Auth{
+		ID:       metaADPrimaryID,
+		Provider: "meta",
+		Metadata: map[string]any{"access_token": "dead-key-0", "api_key": "dead-key-0"},
+	}
+	m := newMetaADManager(t, true, exec, primary, metaADBackup())
+	m.mu.Lock()
+	metaADEnterPending(m.auths[metaADPrimaryID], metaADReasonMintRejected, time.Now())
+	m.mu.Unlock()
+	metaADRequireTracked(t, metaADGet(t, m, metaADPrimaryID), metaADStatePending, metaADReasonMintRejected)
+
+	metaADConfirmDue(m, metaADPrimaryID)
+
+	if got := exec.RefreshCalls(); got != 0 {
+		t.Fatalf("Refresh calls = %d, want 0 (nothing to mint with)", got)
+	}
+	metaADRequireUntouched(t, m, metaADPrimaryID)
+}
+
+func TestMetaAutoDisable_StaleMintSuccessDoesNotStampReplacementKey(t *testing.T) {
+	t.Run("credential replaced during the mint", func(t *testing.T) {
+		exec := newMetaADTestExecutor("dead-key-0", "login-key-9")
+		m := newMetaADManager(t, true, exec, metaADPrimary(), metaADBackup())
+
+		release, wait := metaADBlockedRefresh(t, exec, func() error {
+			_, err := m.refreshAuthForRequest(context.Background(), metaADPrimaryID, "dead-key-0")
+			return err
+		})
+		if _, err := m.Update(context.Background(), metaADReplacementAuth(true)); err != nil {
+			t.Fatalf("Update: %v", err)
+		}
+		release()
+		_ = wait()
+
+		live := metaADGet(t, m, metaADPrimaryID)
+		if key := metaADKey(live); key != "login-key-9" {
+			t.Fatalf("live key = %q, want the replacement login-key-9", key)
+		}
+		if raw := metaADRawState(m, metaADPrimaryID); raw.replacedKey != "" || !raw.replacedAt.IsZero() {
+			t.Fatalf("raw metaAD = %+v, a discarded mint must not stamp the replacement key", raw)
+		}
+
+		// The first rejection of the new key mints normally instead of reading as new_key_rejected.
+		refreshesBefore := exec.RefreshCalls()
+		resp, err := metaADExecute(m, metaADModelA)
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if got := string(resp.Payload); got != metaADPrimaryID+":minted-key-2" {
+			t.Fatalf("payload = %q, want the primary served by a fresh mint", got)
+		}
+		if got := exec.RefreshCalls(); got != refreshesBefore+1 {
+			t.Fatalf("Refresh calls = %d, want %d (a normal re-mint)", got, refreshesBefore+1)
+		}
+		metaADRequireNotTracked(t, metaADGet(t, m, metaADPrimaryID))
+	})
+
+	t.Run("positive control without replacement", func(t *testing.T) {
+		exec := newMetaADTestExecutor("dead-key-0")
+		m := newMetaADManager(t, true, exec, metaADPrimary(), metaADBackup())
+		if _, err := m.refreshAuthForRequest(context.Background(), metaADPrimaryID, "dead-key-0"); err != nil {
+			t.Fatalf("refresh: %v", err)
+		}
+		raw := metaADRawState(m, metaADPrimaryID)
+		if raw.replacedKey != metaADTokenFingerprint("minted-key-1") || raw.replacedAt.IsZero() {
+			t.Fatalf("raw metaAD = %+v, want the minted key stamped", raw)
+		}
+	})
+}
+
+func TestMetaAutoDisable_ConcurrentRejectionsDoNotBypassConfirmationDelay(t *testing.T) {
+	exec := newMetaADTestExecutor()
+	exec.enqueue(
+		metaADRefreshResult{err: metaADMintErr(http.StatusUnauthorized)},
+		metaADRefreshResult{err: metaADMintErr(http.StatusUnauthorized)},
+		metaADRefreshResult{},
+	)
+	m := newMetaADManager(t, true, exec, metaADPrimary(), metaADBackup())
+
+	before := time.Now()
+	release, waitFirst := metaADBlockedRefresh(t, exec, func() error {
+		_, err := m.refreshAuthForRequest(context.Background(), metaADPrimaryID, "dead-key-0")
+		return err
+	})
+	second := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		close(second)
+		_, err := m.refreshAuthForRequest(context.Background(), metaADPrimaryID, "dead-key-0")
+		secondDone <- err
+	}()
+	<-second
+	for i := 0; i < 100; i++ {
+		runtime.Gosched()
+	}
+	release()
+	errFirst, errSecond := waitFirst(), <-secondDone
+	after := time.Now()
+
+	errs := []error{errFirst, errSecond}
+	awaiting, mintRejected := 0, 0
+	for _, err := range errs {
+		switch {
+		case errors.Is(err, errMetaAutoDisableAwaiting):
+			awaiting++
+		case metaADMintRejected(err):
+			mintRejected++
+		default:
+			t.Fatalf("unexpected refresh error %v", err)
+		}
+	}
+	if awaiting != 1 || mintRejected != 1 {
+		t.Fatalf("errors = %v, want one mint rejection and one awaiting error", errs)
+	}
+	if got := exec.RefreshCalls(); got != 1 {
+		t.Fatalf("Refresh calls = %d, want exactly 1", got)
+	}
+	got := metaADGet(t, m, metaADPrimaryID)
+	metaADRequireTracked(t, got, metaADStatePending, metaADReasonMintRejected)
+	if raw := metaADRawState(m, metaADPrimaryID); raw.attempts != 0 || raw.confirmed {
+		t.Fatalf("raw metaAD = %+v, want pending with no attempts and not confirmed", raw)
+	}
+	metaADRequireDueIn(t, got, before, after, metaADConfirmDelay)
+
+	// Sequential variant: another request-path refresh is refused without calling the executor.
+	if _, err := m.refreshAuthForRequest(context.Background(), metaADPrimaryID, "dead-key-0"); !errors.Is(err, errMetaAutoDisableAwaiting) {
+		t.Fatalf("sequential refresh error = %v, want errMetaAutoDisableAwaiting", err)
+	}
+	if got := exec.RefreshCalls(); got != 1 {
+		t.Fatalf("Refresh calls after the sequential request = %d, want 1", got)
+	}
 }

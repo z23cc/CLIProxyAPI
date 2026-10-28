@@ -844,7 +844,7 @@ func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, e
 	if m.metaAutoDisableOnUnauthorized(auth, failedToken) {
 		return auth, false
 	}
-	if alreadyTried || !authHasRefreshCredential(auth) || hasUnauthorizedAuthFailure(auth) {
+	if alreadyTried || (!authHasRefreshCredential(auth) && !m.metaAutoDisableCanMint(auth)) || hasUnauthorizedAuthFailure(auth) {
 		return auth, false
 	}
 	log.Debugf("unauthorized response for %s (%s), refreshing credentials before fallback", auth.Provider, auth.ID)
@@ -988,8 +988,8 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		}
 	}
 
-	if m.metaAutoDisablePreRefresh(auth, forceRefresh) {
-		return nil, errMetaAutoDisableConfirmed
+	if skip, errSkip := m.metaAutoDisablePreRefresh(auth, forceRefresh, failedAccessToken); skip {
+		return nil, errSkip
 	}
 
 	base := auth.Clone()
@@ -1013,6 +1013,10 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	}
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	if err != nil {
+		// Meta auto-disable classifies the failure first, under the per-auth mutation gate.
+		if m.metaAutoDisableOnRefreshError(id, base, err, forceRefresh, now) {
+			return nil, err
+		}
 		unauthorized := isUnauthorizedError(err)
 		invalidGrant := isInvalidGrantError(err)
 		shouldReschedule := false
@@ -1026,22 +1030,6 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 			}
 			if hasUnauthorizedAuthFailure(current) && !forceRefresh {
 				m.mu.Unlock()
-				return nil, err
-			}
-			// Meta auto-disable classifies the failure before the generic branches below.
-			if handled, changed := m.metaAutoDisableOnRefreshError(current, err, forceRefresh, now); handled {
-				if changed {
-					current.Generation++
-					current.UpdatedAt = now
-					m.auths[id] = current
-					if m.scheduler != nil {
-						m.scheduler.upsertAuth(current.Clone())
-					}
-				}
-				m.mu.Unlock()
-				if changed {
-					m.queueRefreshReschedule(id)
-				}
 				return nil, err
 			}
 			wasTerminalUnauthorized := hasUnauthorizedAuthFailure(current)
@@ -1180,6 +1168,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	// Commit its result with context values intact; keep epoch checks and save ordering.
 	saved, errUpdate := m.UpdateRefreshedAuth(context.WithoutCancel(ctx), base, updated)
 	if errUpdate != nil {
+		m.metaAutoDisableOnRefreshSaveError(id, auth)
 		// Warn, not debug: a restart after a lost persist fails with invalid_grant.
 		log.WithFields(log.Fields{"auth_id": auth.ID, "credential": auth.ID, "provider": auth.Provider}).Warnf("persist refreshed auth %s (%s) failed: %v", auth.Provider, auth.ID, errUpdate)
 		return nil, errUpdate
@@ -1187,7 +1176,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	if saved == nil {
 		return nil, fmt.Errorf("auth %s not found", id)
 	}
-	saved = m.metaAutoDisableAfterRefresh(saved, auth, failedAccessToken)
+	saved = m.metaAutoDisableAfterRefresh(saved, auth, metaADKey(updated), failedAccessToken)
 	targetAuth := saved
 	supportedModels, regEpoch := registry.GetGlobalRegistry().GetModelsAndEpochForClient(id)
 	projections := make([]registry.ClientModelProjection, 0, len(supportedModels))

@@ -1338,6 +1338,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				tokenToReject = authAccessTokenForRequest(ctx, auth, result.Options.Headers)
 			}
 			_ = recordRejectedTokenOnAuth(auth, tokenToReject)
+			if m.metaAutoDisableOnRejectedKey(auth, tokenToReject, now) {
+				scheduleUnauthorizedRefresh = true
+			}
 		}
 		if wasTerminalUnauthorized {
 			auth.Unavailable = true
