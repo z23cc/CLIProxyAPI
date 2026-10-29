@@ -45,6 +45,8 @@ type museFakeExecutor struct {
 	calls   []string
 	errs    map[string]error // authID -> error for Execute / ExecuteStream / CountTokens
 	afterFn map[string]error // authID -> error delivered after the first stream payload
+
+	clearAfterFirst bool
 }
 
 func (e *museFakeExecutor) Identifier() string {
@@ -58,6 +60,9 @@ func (e *museFakeExecutor) record(auth *coreauth.Auth) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.calls = append(e.calls, auth.ID)
+	if e.clearAfterFirst && len(e.calls) > 1 {
+		return nil
+	}
 	return e.errs[auth.ID]
 }
 
@@ -75,6 +80,9 @@ func (e *museFakeExecutor) setErr(authID string, err error) {
 	}
 	e.errs[authID] = err
 }
+
+// clearErrAfterFirstCall makes every auth succeed once the first call has been recorded.
+func (e *museFakeExecutor) clearErrAfterFirstCall() { e.clearAfterFirst = true }
 
 func (e *museFakeExecutor) Execute(_ context.Context, auth *coreauth.Auth, _ coreexecutor.Request, _ coreexecutor.Options) (coreexecutor.Response, error) {
 	if err := e.record(auth); err != nil {
@@ -331,11 +339,9 @@ func TestMuseAccountPinHonoredOnSuccess(t *testing.T) {
 					if res.rec.Code != http.StatusOK {
 						t.Fatalf("status = %d, body=%s", res.rec.Code, res.rec.Body.String())
 					}
-					if path != "count" {
-						// Count executions do not report a selected auth, so only execute/stream carry the header.
-						if got := res.rec.Header().Get(logging.MuseAccountHeader); got != env.authB.Index {
-							t.Fatalf("%s = %q, want %q", logging.MuseAccountHeader, got, env.authB.Index)
-						}
+					// Execute, stream and count all publish the selected auth into the trace state.
+					if got := res.rec.Header().Get(logging.MuseAccountHeader); got != env.authB.Index {
+						t.Fatalf("%s = %q, want %q", logging.MuseAccountHeader, got, env.authB.Index)
 					}
 				}
 				for _, id := range env.executor.Calls() {
@@ -516,10 +522,8 @@ func TestMuseAccountPinUpstreamErrorMapping(t *testing.T) {
 						if shape.Error.Metadata.RetryAfterSeconds != tc.retryAfter {
 							t.Fatalf("retry_after_seconds = %d, want %d", shape.Error.Metadata.RetryAfterSeconds, tc.retryAfter)
 						}
-						if path != "count" {
-							if got := res.rec.Header().Get(logging.MuseAccountHeader); got != env.authB.Index {
-								t.Fatalf("%s = %q, want pinned auth %q", logging.MuseAccountHeader, got, env.authB.Index)
-							}
+						if got := res.rec.Header().Get(logging.MuseAccountHeader); got != env.authB.Index {
+							t.Fatalf("%s = %q, want pinned auth %q", logging.MuseAccountHeader, got, env.authB.Index)
 						}
 						return
 					}
@@ -535,14 +539,74 @@ func TestMuseAccountPinUpstreamErrorMapping(t *testing.T) {
 	})
 }
 
-func TestMuseAccountPinStreamErrorAfterFirstChunkIsNotRewritten(t *testing.T) {
-	env := newMuseEnv(t, false)
-	env.executor.afterFn = map[string]error{env.authB.ID: &museStatusErr{status: 402}}
-	res := env.doStream(t, env.authB.Index, museTestModel)
-	if strings.Contains(res.rec.Body.String(), "muse_account_unavailable") || res.rec.Code == http.StatusConflict {
-		t.Fatalf("post-payload stream error was rewritten: status=%d body=%s", res.rec.Code, res.rec.Body.String())
-	}
-	requireCalls(t, env.executor, env.authB.ID)
+func TestMuseAccountPinStreamErrorAfterFirstChunk(t *testing.T) {
+	t.Run("account level error is rewritten", func(t *testing.T) {
+		env := newMuseEnv(t, false)
+		env.executor.afterFn = map[string]error{env.authB.ID: &museStatusErr{status: 402}}
+		res := env.doStream(t, env.authB.Index, museTestModel)
+		requireMuse409(t, res, "payment_required", 402)
+		requireCalls(t, env.executor, env.authB.ID)
+	})
+	t.Run("server error passes through", func(t *testing.T) {
+		env := newMuseEnv(t, false)
+		env.executor.afterFn = map[string]error{env.authB.ID: &museStatusErr{status: 503}}
+		res := env.doStream(t, env.authB.Index, museTestModel)
+		if res.rec.Code != http.StatusServiceUnavailable || strings.Contains(res.rec.Body.String(), "muse_account_unavailable") {
+			t.Fatalf("503 chunk error was rewritten: status=%d body=%s", res.rec.Code, res.rec.Body.String())
+		}
+		requireCalls(t, env.executor, env.authB.ID)
+	})
+}
+
+// newMuseRetryEnv is newMuseEnv with Streaming.BootstrapRetries = 1.
+func newMuseRetryEnv(t *testing.T, affinity bool) *museEnv {
+	t.Helper()
+	env := newMuseEnv(t, affinity)
+	env.handler = NewBaseAPIHandlers(&sdkconfig.SDKConfig{Streaming: sdkconfig.StreamingConfig{BootstrapRetries: 1}}, env.manager)
+	return env
+}
+
+func TestMuseAccountPinBootstrapRetryKeepsFirstError(t *testing.T) {
+	museAffinityModes(t, func(t *testing.T, affinity bool) {
+		t.Run("plain 429 stays 429", func(t *testing.T) {
+			env := newMuseRetryEnv(t, affinity)
+			env.executor.setErr(env.authB.ID, &museStatusErr{status: http.StatusTooManyRequests})
+			res := env.doStream(t, env.authB.Index, museTestModel)
+			if res.rec.Code != http.StatusTooManyRequests {
+				t.Fatalf("status = %d, want passthrough 429; body=%s", res.rec.Code, res.rec.Body.String())
+			}
+			if strings.Contains(res.rec.Body.String(), "muse_account_unavailable") {
+				t.Fatalf("plain 429 was rewritten: %s", res.rec.Body.String())
+			}
+			requireCalls(t, env.executor, env.authB.ID)
+		})
+		t.Run("401 is unauthorized not cooling_down", func(t *testing.T) {
+			env := newMuseRetryEnv(t, affinity)
+			env.executor.setErr(env.authB.ID, &museStatusErr{status: http.StatusUnauthorized})
+			res := env.doStream(t, env.authB.Index, museTestModel)
+			requireMuse409(t, res, "unauthorized", 401)
+			for _, id := range env.executor.Calls() {
+				if id != env.authB.ID {
+					t.Fatalf("executor calls = %v, want only pinned auth %s", env.executor.Calls(), env.authB.ID)
+				}
+			}
+		})
+		t.Run("unpinned request still fails over", func(t *testing.T) {
+			env := newMuseRetryEnv(t, affinity)
+			env.executor.setErr(env.authA.ID, &museStatusErr{status: http.StatusTooManyRequests})
+			env.executor.setErr(env.authB.ID, &museStatusErr{status: http.StatusTooManyRequests})
+			// Whichever auth is picked first fails; clearing the other lets the bootstrap retry succeed there.
+			env.executor.clearErrAfterFirstCall()
+			res := env.doStream(t, "", museTestModel)
+			if res.rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 after failover; body=%s", res.rec.Code, res.rec.Body.String())
+			}
+			calls := env.executor.Calls()
+			if len(calls) != 2 || calls[0] == calls[1] {
+				t.Fatalf("executor calls = %v, want two distinct auths", calls)
+			}
+		})
+	})
 }
 
 func TestMuseAccountPinPrecedence(t *testing.T) {

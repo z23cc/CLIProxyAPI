@@ -181,3 +181,134 @@ func TestResponsesMuseAccountPinWire(t *testing.T) {
 		}
 	}
 }
+
+// musePinChunkExecutor streams a fixed chunk script and records the auth IDs it saw.
+type musePinChunkExecutor struct {
+	musePinFailingExecutor
+	chunks []cliproxyexecutor.StreamChunk
+}
+
+func (e *musePinChunkExecutor) ExecuteStream(_ context.Context, auth *cliproxyauth.Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.record(auth)
+	ch := make(chan cliproxyexecutor.StreamChunk, len(e.chunks))
+	for _, chunk := range e.chunks {
+		ch <- chunk
+	}
+	close(ch)
+	return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
+}
+
+type musePinScopedErr struct{ musePinStatusErr }
+
+func (e *musePinScopedErr) IsCredentialScoped() bool { return true }
+
+func musePinServeStream(t *testing.T, executor cliproxyauth.ProviderExecutor, header func(a, b *cliproxyauth.Auth) string) (*httptest.ResponseRecorder, *cliproxyauth.Auth) {
+	t.Helper()
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	prefix := strings.NewReplacer("/", "-", " ", "-").Replace(t.Name())
+	var auths []*cliproxyauth.Auth
+	for _, suffix := range []string{"-a", "-b"} {
+		auth := &cliproxyauth.Auth{ID: prefix + suffix, Provider: "codex", Status: cliproxyauth.StatusActive, Metadata: map[string]any{"email": prefix + suffix}}
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatal(err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: musePinWireModel}})
+		id := auth.ID
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+		auth.EnsureIndex()
+		auths = append(auths, auth)
+	}
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
+	router := gin.New()
+	router.Use(logging.GinLogrusLogger(), logging.CPATraceIDMiddleware())
+	router.POST("/v1/responses", h.Responses)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"`+musePinWireModel+`","input":"hello","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(logging.MuseAccountHeader, header(auths[0], auths[1]))
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	return recorder, auths[1]
+}
+
+// A chunk error that follows a non-data SSE line (no data frame written yet) must still become the
+// fixed 409 body as an initial HTTP error, never a 401 carrying upstream text.
+func TestResponsesMuseAccountPinStreamErrorAfterComment(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cases := []struct {
+		name     string
+		err      error
+		reason   string
+		upstream int
+	}{
+		{name: "401", err: &musePinStatusErr{status: 401}, reason: "unauthorized", upstream: 401},
+		{name: "402", err: &musePinStatusErr{status: 402}, reason: "payment_required", upstream: 402},
+		{name: "quota_429", err: &musePinScopedErr{musePinStatusErr{status: 429}}, reason: "quota_exhausted", upstream: 429},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			executor := &musePinChunkExecutor{chunks: []cliproxyexecutor.StreamChunk{
+				{Payload: []byte(": ping\n\n")},
+				{Err: tc.err},
+			}}
+			recorder, authB := musePinServeStream(t, executor, func(_, b *cliproxyauth.Auth) string { return b.Index })
+
+			body := recorder.Body.String()
+			if recorder.Code == http.StatusUnauthorized {
+				t.Fatalf("status must never be 401; body=%s", body)
+			}
+			if recorder.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409; body=%s", recorder.Code, body)
+			}
+			var shape struct {
+				Error struct {
+					Code     string `json:"code"`
+					Metadata struct {
+						Reason         string `json:"reason"`
+						UpstreamStatus int    `json:"upstream_status"`
+					} `json:"metadata"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &shape); err != nil {
+				t.Fatalf("body is not JSON: %v: %s", err, body)
+			}
+			if shape.Error.Code != "muse_account_unavailable" || shape.Error.Metadata.Reason != tc.reason || shape.Error.Metadata.UpstreamStatus != tc.upstream {
+				t.Fatalf("error = %+v, want muse_account_unavailable/%s/%d", shape.Error, tc.reason, tc.upstream)
+			}
+			if strings.Contains(body, "Billing verification failed") {
+				t.Fatalf("body leaks upstream text: %s", body)
+			}
+			if len(executor.calls) != 1 || executor.calls[0] != authB.ID {
+				t.Fatalf("executor calls = %v, want only %s", executor.calls, authB.ID)
+			}
+			if got := recorder.Header().Get(logging.MuseAccountHeader); got != authB.Index {
+				t.Fatalf("%s = %q, want %q", logging.MuseAccountHeader, got, authB.Index)
+			}
+		})
+	}
+}
+
+// After a real data frame the HTTP status is already 200, so the account-level error must be emitted as an
+// SSE error event carrying the fixed 409 JSON instead of upstream text.
+func TestResponsesMuseAccountPinStreamErrorAfterDataFrame(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &musePinChunkExecutor{chunks: []cliproxyexecutor.StreamChunk{
+		{Payload: []byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n")},
+		{Err: &musePinStatusErr{status: 401}},
+	}}
+	recorder, authB := musePinServeStream(t, executor, func(_, b *cliproxyauth.Auth) string { return b.Index })
+
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (stream already started); body=%s", recorder.Code, body)
+	}
+	if !strings.Contains(body, "muse_account_unavailable") {
+		t.Fatalf("SSE body lacks the muse error event: %s", body)
+	}
+	if strings.Contains(body, "Billing verification failed") {
+		t.Fatalf("SSE body leaks upstream text: %s", body)
+	}
+	if len(executor.calls) != 1 || executor.calls[0] != authB.ID {
+		t.Fatalf("executor calls = %v, want only %s", executor.calls, authB.ID)
+	}
+}
