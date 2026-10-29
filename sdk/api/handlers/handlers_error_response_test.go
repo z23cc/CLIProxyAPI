@@ -76,6 +76,7 @@ func TestWriteErrorResponseDirectResponse(t *testing.T) {
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	c.Writer.Header().Set("X-Cpa-Trace-Id", "local-trace")
+	c.Writer.Header().Set("X-Muse-Account", "local-account")
 	c.Writer.Header().Set("Access-Control-Allow-Origin", "https://trusted.example")
 
 	handler := NewBaseAPIHandlers(nil, nil)
@@ -87,6 +88,7 @@ func TestWriteErrorResponseDirectResponse(t *testing.T) {
 			"Content-Type":                {"application/problem+json"},
 			"X-Plugin-Policy":             {"blocked"},
 			"X-Cpa-Trace-Id":              {"plugin-trace"},
+			"x-muse-account":              {"plugin-account"},
 			"Access-Control-Allow-Origin": {"https://untrusted.example"},
 		},
 	})
@@ -105,6 +107,9 @@ func TestWriteErrorResponseDirectResponse(t *testing.T) {
 	}
 	if got := recorder.Header().Get("X-Cpa-Trace-Id"); got != "local-trace" {
 		t.Fatalf("X-Cpa-Trace-Id = %q, want local value", got)
+	}
+	if got := recorder.Header().Values("X-Muse-Account"); len(got) != 1 || got[0] != "local-account" {
+		t.Fatalf("X-Muse-Account = %v, want only local value", got)
 	}
 	if got := recorder.Header().Get("Access-Control-Allow-Origin"); got != "https://trusted.example" {
 		t.Fatalf("Access-Control-Allow-Origin = %q, want trusted origin", got)

@@ -1602,6 +1602,9 @@ func TestManagementResponseExposesPluginSupportHeaderForCORS(t *testing.T) {
 			t.Fatalf("Access-Control-Expose-Headers missing %s: %q", headerName, rr.Header().Get("Access-Control-Expose-Headers"))
 		}
 	}
+	if _, ok := exposedHeaders["x-muse-account"]; !ok {
+		t.Fatalf("Access-Control-Expose-Headers missing X-Muse-Account: %q", rr.Header().Get("Access-Control-Expose-Headers"))
+	}
 }
 
 func TestOAuthCallbackRouteSkipsManagementKeyMiddleware(t *testing.T) {
@@ -1928,6 +1931,9 @@ func TestExampleAPIKeySafeModeShowsWarningAndKeepsManagement(t *testing.T) {
 		if got := rr.Header().Get(internallogging.CPATraceIDHeader); got != "" {
 			t.Fatalf("trace ID = %q, want empty before auth selection", got)
 		}
+		if got := rr.Header().Get(internallogging.MuseAccountHeader); got != "" {
+			t.Fatalf("muse account = %q, want empty before auth selection", got)
+		}
 	})
 
 	t.Run("management endpoints still work", func(t *testing.T) {
@@ -1940,6 +1946,9 @@ func TestExampleAPIKeySafeModeShowsWarningAndKeepsManagement(t *testing.T) {
 		}
 		if got := rr.Header().Get(internallogging.CPATraceIDHeader); got != "" {
 			t.Fatalf("management trace ID = %q, want empty", got)
+		}
+		if got := rr.Header().Get(internallogging.MuseAccountHeader); got != "" {
+			t.Fatalf("management muse account = %q, want empty", got)
 		}
 	})
 

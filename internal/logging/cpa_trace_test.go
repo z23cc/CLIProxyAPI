@@ -3,6 +3,7 @@ package logging
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -48,6 +49,26 @@ func TestCPATraceIDMiddlewareRequiresAuthIndexBeforeResponseCommit(t *testing.T)
 		SetGinCPATraceID(c, "")
 		c.Status(http.StatusOK)
 	})
+	engine.GET("/failover", func(c *gin.Context) {
+		SetGinRequestID(c, "1234abcd")
+		SetGinCPATraceID(c, "auth-one")
+		SetGinCPATraceID(c, "auth-two")
+		c.Status(http.StatusOK)
+	})
+	engine.GET("/flush", func(c *gin.Context) {
+		SetGinRequestID(c, "1234abcd")
+		SetGinCPATraceID(c, "auth-index")
+		c.Writer.Flush()
+	})
+	engine.GET("/write-header", func(c *gin.Context) {
+		SetGinRequestID(c, "1234abcd")
+		SetGinCPATraceID(c, "auth-index")
+		c.Writer.WriteHeader(http.StatusAccepted)
+	})
+	engine.GET("/none", func(c *gin.Context) {
+		SetGinRequestID(c, "1234abcd")
+		c.Status(http.StatusOK)
+	})
 	engine.GET("/committed", func(c *gin.Context) {
 		SetGinRequestID(c, "1234abcd")
 		c.Writer.WriteHeaderNow()
@@ -65,6 +86,51 @@ func TestCPATraceIDMiddlewareRequiresAuthIndexBeforeResponseCommit(t *testing.T)
 		if got := traceID[15:]; got != "auth-index-1234abcd" {
 			t.Fatalf("trace suffix = %q, want %q", got, "auth-index-1234abcd")
 		}
+		if got := recorder.Header().Get(MuseAccountHeader); got != "auth-index" {
+			t.Fatalf("%s = %q, want %q", MuseAccountHeader, got, "auth-index")
+		}
+		if !strings.HasPrefix(traceID[15:], recorder.Header().Get(MuseAccountHeader)+"-") {
+			t.Fatalf("trace ID %q does not embed %s", traceID, recorder.Header().Get(MuseAccountHeader))
+		}
+	})
+
+	t.Run("failover uses last auth index", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/failover", nil))
+
+		if got := recorder.Header().Get(MuseAccountHeader); got != "auth-two" {
+			t.Fatalf("%s = %q, want %q", MuseAccountHeader, got, "auth-two")
+		}
+		if got := recorder.Header().Get(CPATraceIDHeader)[15:]; got != "auth-two-1234abcd" {
+			t.Fatalf("trace suffix = %q, want %q", got, "auth-two-1234abcd")
+		}
+	})
+
+	t.Run("flush as first write carries headers", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/flush", nil))
+
+		if got := recorder.Header().Get(MuseAccountHeader); got != "auth-index" {
+			t.Fatalf("%s = %q, want %q", MuseAccountHeader, got, "auth-index")
+		}
+	})
+
+	t.Run("write header as first write carries headers", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/write-header", nil))
+
+		if got := recorder.Header().Get(MuseAccountHeader); got != "auth-index" {
+			t.Fatalf("%s = %q, want %q", MuseAccountHeader, got, "auth-index")
+		}
+	})
+
+	t.Run("no selection has no account header", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/none", nil))
+
+		if _, ok := recorder.Header()[MuseAccountHeader]; ok {
+			t.Fatalf("%s = %q, want absent", MuseAccountHeader, recorder.Header().Get(MuseAccountHeader))
+		}
 	})
 
 	t.Run("skips empty auth index", func(t *testing.T) {
@@ -74,6 +140,9 @@ func TestCPATraceIDMiddlewareRequiresAuthIndexBeforeResponseCommit(t *testing.T)
 		if got := recorder.Header().Get(CPATraceIDHeader); got != "" {
 			t.Fatalf("trace ID = %q, want empty", got)
 		}
+		if _, ok := recorder.Header()[MuseAccountHeader]; ok {
+			t.Fatalf("%s present, want absent", MuseAccountHeader)
+		}
 	})
 
 	t.Run("skips committed response", func(t *testing.T) {
@@ -82,6 +151,9 @@ func TestCPATraceIDMiddlewareRequiresAuthIndexBeforeResponseCommit(t *testing.T)
 
 		if got := recorder.Header().Get(CPATraceIDHeader); got != "" {
 			t.Fatalf("trace ID = %q, want empty", got)
+		}
+		if _, ok := recorder.Header()[MuseAccountHeader]; ok {
+			t.Fatalf("%s present, want absent", MuseAccountHeader)
 		}
 	})
 }

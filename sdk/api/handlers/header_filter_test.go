@@ -16,6 +16,7 @@ func TestFilterUpstreamHeaders_RemovesConnectionScopedHeaders(t *testing.T) {
 	src.Set("X-Request-Id", "req-1")
 	src.Set("Set-Cookie", "session=secret")
 	src.Set("x-cpa-trace-id", "upstream-trace")
+	src.Set("x-muse-account", "upstream-account")
 	src.Set("Access-Control-Expose-Headers", "upstream-header")
 
 	filtered := FilterUpstreamHeaders(src)
@@ -36,6 +37,7 @@ func TestFilterUpstreamHeaders_RemovesConnectionScopedHeaders(t *testing.T) {
 		"X-Hop-C",
 		"Set-Cookie",
 		"x-cpa-trace-id",
+		"X-Muse-Account",
 		"Access-Control-Expose-Headers",
 	}
 	for _, key := range blockedHeaderKeys {
@@ -55,5 +57,13 @@ func TestFilterUpstreamHeaders_ReturnsNilWhenAllHeadersBlocked(t *testing.T) {
 	filtered := FilterUpstreamHeaders(src)
 	if filtered != nil {
 		t.Fatalf("expected nil when all headers are filtered, got %#v", filtered)
+	}
+}
+
+func TestIsCPAReservedResponseHeader_MuseAccount(t *testing.T) {
+	for _, name := range []string{"X-Muse-Account", "x-muse-account", "X-MUSE-ACCOUNT"} {
+		if !IsCPAReservedResponseHeader(name) {
+			t.Fatalf("%s should be CPA reserved", name)
+		}
 	}
 }

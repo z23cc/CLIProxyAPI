@@ -1233,6 +1233,128 @@ func TestExecuteStreamWithAuthManager_SelectedAuthCallbackReceivesAuthID(t *test
 	}
 }
 
+type failOnceExecuteExecutor struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (e *failOnceExecuteExecutor) Identifier() string { return "codex" }
+
+func (e *failOnceExecuteExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	e.mu.Lock()
+	e.calls++
+	call := e.calls
+	e.mu.Unlock()
+	if call == 1 {
+		return coreexecutor.Response{}, &coreauth.Error{Code: "unavailable", Message: "unavailable", Retryable: true, HTTPStatus: http.StatusServiceUnavailable}
+	}
+	return coreexecutor.Response{Payload: []byte("ok")}, nil
+}
+
+func (e *failOnceExecuteExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	return nil, &coreauth.Error{Code: "not_implemented", Message: "ExecuteStream not implemented"}
+}
+
+func (e *failOnceExecuteExecutor) Refresh(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *failOnceExecuteExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "CountTokens not implemented"}
+}
+
+func (e *failOnceExecuteExecutor) HttpRequest(ctx context.Context, auth *coreauth.Auth, req *http.Request) (*http.Response, error) {
+	return nil, &coreauth.Error{Code: "not_implemented", Message: "HttpRequest not implemented", HTTPStatus: http.StatusNotImplemented}
+}
+
+func registerTwoCodexAuths(t *testing.T, manager *coreauth.Manager) (*coreauth.Auth, *coreauth.Auth) {
+	t.Helper()
+	auths := make([]*coreauth.Auth, 0, 2)
+	for _, id := range []string{"auth1", "auth2"} {
+		auth := &coreauth.Auth{ID: id, Provider: "codex", Status: coreauth.StatusActive, Metadata: map[string]any{"email": id + "@example.com"}}
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("manager.Register(%s): %v", id, err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+		authID := auth.ID
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+		auths = append(auths, auth)
+	}
+	return auths[0], auths[1]
+}
+
+func TestMuseAccountHeaderFailoverUsesLastAuth(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, stream := range []bool{false, true} {
+		name := "non_stream"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			manager := coreauth.NewManager(nil, nil, nil)
+			if stream {
+				manager.RegisterExecutor(&failOnceStreamExecutor{})
+			} else {
+				manager.RegisterExecutor(&failOnceExecuteExecutor{})
+			}
+			auth1, auth2 := registerTwoCodexAuths(t, manager)
+			handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+				Streaming: sdkconfig.StreamingConfig{BootstrapRetries: 1},
+			}, manager)
+
+			var selected []string
+			engine := gin.New()
+			engine.Use(logging.CPATraceIDMiddleware())
+			engine.POST("/v1/responses", func(c *gin.Context) {
+				logging.SetGinRequestID(c, "1234abcd")
+				ctx := context.WithValue(context.Background(), "gin", c)
+				ctx = WithSelectedAuthIDCallback(ctx, func(authID string) { selected = append(selected, authID) })
+				var out []byte
+				if stream {
+					dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(ctx, "openai", "test-model", []byte(`{"model":"test-model"}`), "")
+					for chunk := range dataChan {
+						out = append(out, chunk...)
+					}
+					for msg := range errChan {
+						if msg != nil {
+							t.Errorf("unexpected error: %+v", msg)
+						}
+					}
+				} else {
+					var errMsg *interfaces.ErrorMessage
+					out, _, errMsg = handler.ExecuteWithAuthManager(ctx, "openai", "test-model", []byte(`{"model":"test-model"}`), "")
+					if errMsg != nil {
+						t.Errorf("unexpected error: %+v", errMsg)
+					}
+				}
+				_, _ = c.Writer.Write(out)
+			})
+			recorder := httptest.NewRecorder()
+			engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", nil))
+
+			if len(selected) != 2 || selected[0] == selected[1] {
+				t.Fatalf("selected auths = %v, want two distinct attempts", selected)
+			}
+			want := auth1.Index
+			if selected[1] == auth2.ID {
+				want = auth2.Index
+			}
+			if want == "" {
+				t.Fatal("last auth index is empty")
+			}
+			if got := recorder.Header().Get(logging.MuseAccountHeader); got != want {
+				t.Fatalf("%s = %q, want last attempt index %q", logging.MuseAccountHeader, got, want)
+			}
+			if got := strings.Split(recorder.Header().Get(logging.CPATraceIDHeader), "-")[1]; got != want {
+				t.Fatalf("trace ID auth segment = %q, want %q", got, want)
+			}
+			if recorder.Body.String() != "ok" {
+				t.Fatalf("body = %q, want ok", recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestExecuteStreamWithAuthManager_ValidatesOpenAIResponsesStreamDataJSON(t *testing.T) {
 	executor := &invalidJSONStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
