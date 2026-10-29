@@ -1455,3 +1455,166 @@ func TestExecuteStreamWithAuthManager_AllowsSplitOpenAIResponsesSSEEventLines(t 
 		t.Fatalf("unexpected second chunk.\nGot:  %q\nWant: %q", got[1], expectedData)
 	}
 }
+
+type museRecordingExecutor struct {
+	mu      sync.Mutex
+	authIDs []string
+}
+
+func (e *museRecordingExecutor) record(auth *coreauth.Auth) {
+	e.mu.Lock()
+	e.authIDs = append(e.authIDs, auth.ID)
+	e.mu.Unlock()
+}
+
+func (e *museRecordingExecutor) AuthIDs() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.authIDs...)
+}
+
+func (e *museRecordingExecutor) Identifier() string { return "codex" }
+
+func (e *museRecordingExecutor) Execute(_ context.Context, auth *coreauth.Auth, _ coreexecutor.Request, _ coreexecutor.Options) (coreexecutor.Response, error) {
+	e.record(auth)
+	return coreexecutor.Response{Payload: []byte("ok")}, nil
+}
+
+func (e *museRecordingExecutor) ExecuteStream(_ context.Context, auth *coreauth.Auth, _ coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	e.record(auth)
+	ch := make(chan coreexecutor.StreamChunk, 1)
+	ch <- coreexecutor.StreamChunk{Payload: []byte("ok")}
+	close(ch)
+	return &coreexecutor.StreamResult{Chunks: ch}, nil
+}
+
+func (e *museRecordingExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *museRecordingExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "CountTokens not implemented"}
+}
+
+func (e *museRecordingExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, &coreauth.Error{Code: "not_implemented", Message: "HttpRequest not implemented", HTTPStatus: http.StatusNotImplemented}
+}
+
+// runMuseNestedRequest serves one request through CPATraceIDMiddleware. When outerAuthID is set the
+// outer execution is pinned to it; nested then runs against the same Gin context, like a response
+// interceptor calling ExecuteModel / ExecuteModelStream.
+func runMuseNestedRequest(t *testing.T, stream bool, outerAuthID string, nestedAuthID string) (*httptest.ResponseRecorder, *museRecordingExecutor, *coreauth.Auth, *coreauth.Auth) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	executor := &museRecordingExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	authA, authB := registerTwoCodexAuths(t, manager)
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	pick := func(id string) string {
+		switch id {
+		case "A":
+			return authA.ID
+		case "B":
+			return authB.ID
+		}
+		return ""
+	}
+
+	engine := gin.New()
+	engine.Use(logging.CPATraceIDMiddleware())
+	engine.POST("/v1/responses", func(c *gin.Context) {
+		logging.SetGinRequestID(c, "1234abcd")
+		ctx := context.WithValue(context.Background(), "gin", c)
+		body := []byte(`{"model":"test-model"}`)
+		if outerAuthID != "" {
+			outerCtx := WithPinnedAuthID(ctx, pick(outerAuthID))
+			if _, _, errMsg := handler.ExecuteWithAuthManager(outerCtx, "openai", "test-model", body, ""); errMsg != nil {
+				t.Errorf("outer execute: %+v", errMsg)
+			}
+		}
+		req := ModelExecutionRequest{EntryProtocol: "openai", ExitProtocol: "openai", Model: "test-model", Body: body, AuthID: pick(nestedAuthID), Stream: stream}
+		if stream {
+			s, errMsg := handler.ExecuteModelStream(ctx, req)
+			if errMsg != nil {
+				t.Errorf("nested stream: %+v", errMsg)
+				return
+			}
+			for chunk := range s.Chunks {
+				if chunk.Err != nil {
+					t.Errorf("nested stream chunk error: %v", chunk.Err)
+				}
+			}
+		} else if _, errMsg := handler.ExecuteModel(ctx, req); errMsg != nil {
+			t.Errorf("nested execute: %+v", errMsg)
+		}
+		_, _ = c.Writer.Write([]byte("done"))
+	})
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", nil))
+	return recorder, executor, authA, authB
+}
+
+func TestMuseAccountHeaderIgnoresNestedInternalExecution(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		name := "non_stream"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			recorder, executor, authA, authB := runMuseNestedRequest(t, stream, "A", "B")
+
+			if ids := executor.AuthIDs(); len(ids) != 2 || ids[0] != authA.ID || ids[1] != authB.ID {
+				t.Fatalf("executed auths = %v, want [%s %s]", ids, authA.ID, authB.ID)
+			}
+			if got := recorder.Header().Get(logging.MuseAccountHeader); got != authA.Index {
+				t.Fatalf("%s = %q, want outer auth %q (nested was %q)", logging.MuseAccountHeader, got, authA.Index, authB.Index)
+			}
+			traceID := recorder.Header().Get(logging.CPATraceIDHeader)
+			if len(traceID) < 15 || !strings.HasPrefix(traceID[15:], authA.Index+"-") {
+				t.Fatalf("trace ID = %q, want outer auth index %q", traceID, authA.Index)
+			}
+		})
+	}
+}
+
+func TestMuseAccountHeaderAbsentForNestedOnlyExecution(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		name := "non_stream"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			recorder, executor, _, authB := runMuseNestedRequest(t, stream, "", "B")
+
+			if ids := executor.AuthIDs(); len(ids) != 1 || ids[0] != authB.ID {
+				t.Fatalf("executed auths = %v, want [%s]", ids, authB.ID)
+			}
+			if _, ok := recorder.Header()[logging.MuseAccountHeader]; ok {
+				t.Fatalf("%s = %q, want absent", logging.MuseAccountHeader, recorder.Header().Get(logging.MuseAccountHeader))
+			}
+			if got := recorder.Header().Get(logging.CPATraceIDHeader); got != "" {
+				t.Fatalf("trace ID = %q, want empty", got)
+			}
+		})
+	}
+}
+
+func TestAddModelExecutionSourceMetadataSelectedAuthIndexCallback(t *testing.T) {
+	newMeta := func() map[string]any {
+		return map[string]any{coreexecutor.SelectedAuthIndexCallbackMetadataKey: func(string) {}}
+	}
+	internal := newMeta()
+	addModelExecutionSourceMetadata(internal, true)
+	if _, ok := internal[coreexecutor.SelectedAuthIndexCallbackMetadataKey]; ok {
+		t.Fatal("selected auth index callback kept for internal source")
+	}
+	if internal[modelExecutionMetadataSourceKey] != modelExecutionInternalSource {
+		t.Fatalf("source metadata = %v, want %q", internal[modelExecutionMetadataSourceKey], modelExecutionInternalSource)
+	}
+	external := newMeta()
+	addModelExecutionSourceMetadata(external, false)
+	if _, ok := external[coreexecutor.SelectedAuthIndexCallbackMetadataKey]; !ok {
+		t.Fatal("selected auth index callback removed for non-internal source")
+	}
+}

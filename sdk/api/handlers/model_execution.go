@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	"golang.org/x/net/context"
@@ -286,11 +287,14 @@ func cloneURLValues(src url.Values) url.Values {
 	return dst
 }
 
+// addModelExecutionSourceMetadata marks internal executions. They share the outer request's Gin
+// context, so they must not report their selected auth into the outer request's trace state.
 func addModelExecutionSourceMetadata(meta map[string]any, internalSource bool) {
 	if !internalSource || meta == nil {
 		return
 	}
 	meta[modelExecutionMetadataSourceKey] = modelExecutionInternalSource
+	delete(meta, coreexecutor.SelectedAuthIndexCallbackMetadataKey)
 }
 
 func prepareModelExecutionStream(ctx context.Context, dataChan <-chan []byte, errChan <-chan *interfaces.ErrorMessage) (<-chan ModelExecutionChunk, *interfaces.ErrorMessage) {
