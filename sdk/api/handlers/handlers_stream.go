@@ -561,7 +561,13 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 		if retryErr != nil {
 			originalBootstrapErr := musePin.errorMessage(bootstrapStreamErr, normalizedModel)
-			if isAuthSelectionUnavailable(retryErr) && originalBootstrapErr.StatusCode >= http.StatusInternalServerError {
+			keepOriginal := isAuthSelectionUnavailable(retryErr) && originalBootstrapErr.StatusCode >= http.StatusInternalServerError
+			if musePin != nil {
+				// The first attempt usually put the pinned account out of rotation, so report the
+				// first attempt's error rather than the retry's (a plain 429 stays a 429).
+				keepOriginal = isAuthSelectionUnavailable(retryErr) || isModelCooldownError(retryErr)
+			}
+			if keepOriginal {
 				bootstrapErr = originalBootstrapErr
 			} else {
 				bootstrapErr = musePin.errorMessage(enrichAuthSelectionError(retryErr, providers, normalizedModel), normalizedModel)
@@ -692,7 +698,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 				return
 			}
 			if chunk.Err != nil {
-				errMsg := executionErrorMessage(chunk.Err)
+				errMsg := musePin.errorMessage(chunk.Err, normalizedModel)
 				completionOutcome = pluginapi.RequestCompletionFailed
 				completionStatus = errMsg.StatusCode
 				completionErr = chunk.Err
