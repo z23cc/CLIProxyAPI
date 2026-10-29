@@ -13,6 +13,9 @@ import (
 // CPATraceIDHeader is the downstream response header used to correlate requests with selected credentials.
 const CPATraceIDHeader = "X-CPA-TRACE-ID"
 
+// MuseAccountHeader is the downstream response header carrying the auth index of the last selected credential.
+const MuseAccountHeader = "X-Muse-Account"
+
 const ginCPATraceStateKey = "__cpa_trace_state__"
 
 // FormatCPATraceID builds a CPA trace ID from the selection time, auth index, and request ID.
@@ -26,27 +29,29 @@ func FormatCPATraceID(selectedAt time.Time, authIndex, requestID string) string 
 }
 
 type cpaTraceState struct {
-	mu      sync.RWMutex
-	traceID string
+	mu        sync.RWMutex
+	traceID   string
+	authIndex string
 }
 
-func (s *cpaTraceState) set(traceID string) {
+func (s *cpaTraceState) set(traceID, authIndex string) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	s.traceID = strings.TrimSpace(traceID)
+	s.authIndex = strings.TrimSpace(authIndex)
 	s.mu.Unlock()
 }
 
-func (s *cpaTraceState) get() string {
+func (s *cpaTraceState) get() (traceID, authIndex string) {
 	if s == nil {
-		return ""
+		return "", ""
 	}
 	s.mu.RLock()
-	traceID := s.traceID
+	traceID, authIndex = s.traceID, s.authIndex
 	s.mu.RUnlock()
-	return traceID
+	return traceID, authIndex
 }
 
 func ginCPATraceState(c *gin.Context) *cpaTraceState {
@@ -79,7 +84,7 @@ func GinCPATraceIDCallback(c *gin.Context) func(string) {
 	}
 	return func(authIndex string) {
 		if traceID := FormatCPATraceID(time.Now(), authIndex, requestID); traceID != "" {
-			state.set(traceID)
+			state.set(traceID, authIndex)
 		}
 	}
 }
@@ -101,7 +106,8 @@ func GetGinCPATraceID(c *gin.Context) string {
 		return ""
 	}
 	state, _ := value.(*cpaTraceState)
-	return state.get()
+	traceID, _ := state.get()
+	return traceID
 }
 
 // CPATraceIDMiddleware injects a stored trace ID immediately before response headers are committed.
@@ -159,7 +165,9 @@ func (w *cpaTraceResponseWriter) applyTraceHeader() {
 	if w == nil || w.ResponseWriter == nil || w.ResponseWriter.Written() {
 		return
 	}
-	if traceID := w.state.get(); traceID != "" {
-		w.ResponseWriter.Header().Set(CPATraceIDHeader, traceID)
+	if traceID, authIndex := w.state.get(); traceID != "" {
+		header := w.ResponseWriter.Header()
+		header.Set(CPATraceIDHeader, traceID)
+		header.Set(MuseAccountHeader, authIndex)
 	}
 }
